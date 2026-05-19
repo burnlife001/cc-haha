@@ -17,6 +17,7 @@ describe('ConversationService', () => {
   let originalOAuthToken: string | undefined
   let originalProviderManagedByHost: string | undefined
   let originalDiagnosticsFile: string | undefined
+  let originalAttributionHeader: string | undefined
   let originalHome: string | undefined
   let originalPath: string | undefined
   let originalShell: string | undefined
@@ -34,6 +35,7 @@ describe('ConversationService', () => {
     originalOAuthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN
     originalProviderManagedByHost = process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
     originalDiagnosticsFile = process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
+    originalAttributionHeader = process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
     originalHome = process.env.HOME
     originalPath = process.env.PATH
     originalShell = process.env.SHELL
@@ -51,6 +53,7 @@ describe('ConversationService', () => {
     delete process.env.CLAUDE_CODE_ENTRYPOINT
     delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
     delete process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
+    delete process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
     process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV = '1'
     resetTerminalShellEnvironmentCacheForTests()
   })
@@ -82,6 +85,9 @@ describe('ConversationService', () => {
 
     if (originalDiagnosticsFile === undefined) delete process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
     else process.env.CLAUDE_CODE_DIAGNOSTICS_FILE = originalDiagnosticsFile
+
+    if (originalAttributionHeader === undefined) delete process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
+    else process.env.CLAUDE_CODE_ATTRIBUTION_HEADER = originalAttributionHeader
 
     if (originalHome === undefined) delete process.env.HOME
     else process.env.HOME = originalHome
@@ -133,6 +139,7 @@ describe('ConversationService', () => {
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('test-token')
     expect(env.ANTHROPIC_BASE_URL).toBe('https://example.invalid/anthropic')
     expect(env.ANTHROPIC_MODEL).toBe('test-model')
+    expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
     expect(env.CLAUDE_CODE_DIAGNOSTICS_FILE).toBe(path.join(tmpDir, 'cc-haha', 'diagnostics', 'cli-diagnostics.jsonl'))
     expect(env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE).toBe(
       `${path.join(tmpDir, 'projects', 'D--workspace-code-myself-code-cc-haha', 'memory')}${path.sep}`,
@@ -280,6 +287,7 @@ describe('ConversationService', () => {
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('kimi-k2.6')
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('kimi-k2.6')
     expect(env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBe('1')
+    expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
     expect(env.CLAUDE_CODE_ENTRYPOINT).toBeUndefined()
   })
 
@@ -307,6 +315,7 @@ describe('ConversationService', () => {
 
     expect(env.ANTHROPIC_BASE_URL).toBe(`http://127.0.0.1:3456/proxy/providers/${provider.id}`)
     expect(env.ANTHROPIC_MODEL).toBe('new-provider-sonnet')
+    expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
   })
 
   test('buildChildEnv clears stale api key for bearer-token providers', async () => {
@@ -336,6 +345,7 @@ describe('ConversationService', () => {
     expect(env.ANTHROPIC_API_KEY).toBe('')
     expect(env.ANTHROPIC_MODEL).toBe('claude-sonnet-4-6')
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe('none')
+    expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('1')
   })
 
   test('buildChildEnv can force official auth even when a custom default provider exists', async () => {

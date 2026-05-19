@@ -20,6 +20,10 @@ import type { AnthropicRequest, AnthropicResponse } from '../proxy/transform/typ
 import { PROVIDER_PRESETS } from '../config/providerPresets.js'
 import { MODEL_CONTEXT_WINDOWS_ENV_KEY } from '../../utils/model/modelContextWindows.js'
 import {
+  ATTRIBUTION_HEADER_ENV_KEY,
+  attributionHeaderEnvForModel,
+} from './attributionHeaderPolicy.js'
+import {
   CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
   ensurePersistentStorageUpgraded,
 } from './persistentStorageMigrations.js'
@@ -47,6 +51,7 @@ const MANAGED_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  ATTRIBUTION_HEADER_ENV_KEY,
   MODEL_CONTEXT_WINDOWS_ENV_KEY,
 ] as const
 
@@ -393,6 +398,7 @@ export class ProviderService {
       ANTHROPIC_DEFAULT_HAIKU_MODEL: provider.models.haiku,
       ANTHROPIC_DEFAULT_SONNET_MODEL: provider.models.sonnet,
       ANTHROPIC_DEFAULT_OPUS_MODEL: provider.models.opus,
+      ...attributionHeaderEnvForModel(provider.models.main),
     }
   }
 

@@ -620,6 +620,7 @@ describe('Models API', () => {
 
     const managedSettings = await providerSvc.getManagedSettings()
     expect(managedSettings.model).toBe('glm-5-turbo')
+    expect((managedSettings.env as Record<string, string>).CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
 
     const globalSettings = await settingsSvc.getUserSettings()
     expect(globalSettings.model).toBeUndefined()

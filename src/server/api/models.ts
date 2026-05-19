@@ -10,6 +10,7 @@
 
 import { SettingsService } from '../services/settingsService.js'
 import { ProviderService } from '../services/providerService.js'
+import { attributionHeaderEnvForModel } from '../services/attributionHeaderPolicy.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
 import { hasOpenAIAuthLogin } from '../../utils/auth.js'
 import { OPENAI_CODEX_MODEL_CATALOG } from '../../services/openaiAuth/models.js'
@@ -275,7 +276,16 @@ async function handleCurrentModel(req: Request): Promise<Response> {
     }
     const { activeId } = await providerService.listProviders()
     if (activeId) {
-      await providerService.updateManagedSettings(updates)
+      const currentManagedSettings = await providerService.getManagedSettings()
+      const currentEnv =
+        (currentManagedSettings.env as Record<string, string> | undefined) ?? {}
+      await providerService.updateManagedSettings({
+        ...updates,
+        env: {
+          ...currentEnv,
+          ...attributionHeaderEnvForModel(baseId),
+        },
+      })
     } else {
       await settingsService.updateUserSettings(updates)
     }
