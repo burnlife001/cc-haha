@@ -42,7 +42,7 @@ export async function handleHahaOpenAIOAuthApi(
       if (!parsed.success) {
         throw ApiError.badRequest('serverPort (positive integer) required')
       }
-      const session = hahaOpenAIOAuthService.startSession({
+      const session = await hahaOpenAIOAuthService.startSession({
         serverPort: parsed.data.serverPort,
       })
       return Response.json({

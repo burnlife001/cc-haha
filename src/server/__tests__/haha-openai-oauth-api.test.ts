@@ -24,6 +24,8 @@ async function setup() {
 }
 
 async function teardown() {
+  hahaOpenAIOAuthService.dispose()
+  hahaOpenAIOAuthService.resetCallbackPortForTests()
   if (originalConfigDir === undefined) {
     delete process.env.CLAUDE_CONFIG_DIR
   } else {
@@ -68,6 +70,9 @@ describe('POST /api/haha-openai-oauth/start', () => {
   afterEach(teardown)
 
   test('returns authorize URL with PKCE challenge', async () => {
+    const callbackPort = await getFreePort()
+    hahaOpenAIOAuthService.setCallbackPortForTests(callbackPort)
+
     const { req, url, segments } = buildReq(
       'POST',
       '/api/haha-openai-oauth/start',
@@ -81,6 +86,9 @@ describe('POST /api/haha-openai-oauth/start', () => {
       'codex_cli_simplified_flow=true',
     )
     expect(data.authorizeUrl).toContain(
+      encodeURIComponent(`http://localhost:${callbackPort}/auth/callback`),
+    )
+    expect(data.authorizeUrl).not.toContain(
       encodeURIComponent('http://localhost:54321/auth/callback'),
     )
     expect(data.authorizeUrl).not.toContain('originator=')

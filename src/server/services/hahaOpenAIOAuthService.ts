@@ -12,6 +12,7 @@
 import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
+import { AuthCodeListener } from '../../services/oauth/auth-code-listener.js'
 import {
   buildOpenAIAuthorizeUrl,
   exchangeOpenAICodeForTokens,
@@ -22,6 +23,7 @@ import {
   normalizeOpenAITokens,
   withRefreshedAccessToken,
   OPENAI_CODEX_REDIRECT_PATH,
+  OPENAI_CODEX_OAUTH_PORT,
 } from '../../services/openaiAuth/client.js'
 import type { OpenAIOAuthTokenResponse } from '../../services/openaiAuth/types.js'
 
@@ -39,8 +41,10 @@ export type OpenAIOAuthSession = {
   state: string
   codeVerifier: string
   authorizeUrl: string
-  serverPort: number
+  redirectUri: string
   createdAt: number
+  authCodeListener?: AuthCodeListener
+  expiresTimer?: ReturnType<typeof setTimeout>
 }
 
 type OpenAIRefreshFn = (
@@ -48,6 +52,30 @@ type OpenAIRefreshFn = (
 ) => Promise<OpenAIOAuthTokenResponse>
 
 const SESSION_TTL_MS = 5 * 60 * 1000
+
+const HTML_SUCCESS = `<!doctype html>
+<html><head><meta charset="utf-8"><title>OpenAI Login Success</title>
+<style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#fafafa;color:#333}.card{text-align:center;padding:40px;background:white;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.06)}h1{color:#16a34a;margin:0 0 12px}p{color:#666}</style>
+</head><body><div class="card"><h1>OpenAI Login Successful</h1><p>You can close this window and return to Claude Code Haha.</p></div>
+<script>setTimeout(() => window.close(), 1500)</script>
+</body></html>`
+
+function renderErrorHtml(message: string): string {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>OpenAI Login Failed</title>
+<style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#fafafa;color:#333}.card{text-align:center;padding:40px;background:white;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.06)}h1{color:#dc2626;margin:0 0 12px}pre{color:#666;white-space:pre-wrap;word-break:break-word;text-align:left;background:#f5f5f5;padding:12px;border-radius:6px}</style>
+</head><body><div class="card"><h1>OpenAI Login Failed</h1><pre>${escapeHtml(message)}</pre></div>
+</body></html>`
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
 
 export function getHahaOpenAIOAuthFilePath(): string {
   const configDir =
@@ -58,9 +86,24 @@ export function getHahaOpenAIOAuthFilePath(): string {
 export class HahaOpenAIOAuthService {
   private sessions = new Map<string, OpenAIOAuthSession>()
   private refreshFn: OpenAIRefreshFn = refreshOpenAITokens
+  private callbackPort: number
+
+  constructor(options: { callbackPort?: number } = {}) {
+    this.callbackPort = options.callbackPort ?? OPENAI_CODEX_OAUTH_PORT
+  }
 
   setRefreshFn(fn: OpenAIRefreshFn): void {
     this.refreshFn = fn
+  }
+
+  setCallbackPortForTests(port: number): void {
+    this.dispose()
+    this.callbackPort = port
+  }
+
+  resetCallbackPortForTests(): void {
+    this.dispose()
+    this.callbackPort = OPENAI_CODEX_OAUTH_PORT
   }
 
   getOAuthFilePath(): string {
@@ -101,13 +144,25 @@ export class HahaOpenAIOAuthService {
     }
   }
 
-  startSession({ serverPort }: { serverPort: number }): OpenAIOAuthSession {
+  async startSession(_input: { serverPort: number }): Promise<OpenAIOAuthSession> {
     this.pruneExpiredSessions()
+    this.dispose()
 
     const codeVerifier = generateOpenAICodeVerifier()
     const state = generateOpenAIState()
+    const authCodeListener = new AuthCodeListener(OPENAI_CODEX_REDIRECT_PATH)
 
-    const redirectUri = `http://localhost:${serverPort}${OPENAI_CODEX_REDIRECT_PATH}`
+    try {
+      await authCodeListener.start(this.callbackPort)
+    } catch (err) {
+      authCodeListener.close()
+      const message = err instanceof Error ? err.message : String(err)
+      throw new Error(
+        `OpenAI OAuth callback port ${this.callbackPort} is unavailable: ${message}`,
+      )
+    }
+
+    const redirectUri = `http://localhost:${this.callbackPort}${OPENAI_CODEX_REDIRECT_PATH}`
     const authorizeUrl = buildOpenAIAuthorizeUrl({
       redirectUri,
       codeVerifier,
@@ -118,10 +173,20 @@ export class HahaOpenAIOAuthService {
       state,
       codeVerifier,
       authorizeUrl,
-      serverPort,
+      redirectUri,
       createdAt: Date.now(),
+      authCodeListener,
     }
+    session.expiresTimer = setTimeout(() => {
+      if (this.sessions.get(state) === session) {
+        this.closeSession(session)
+        this.sessions.delete(state)
+      }
+    }, SESSION_TTL_MS)
+    session.expiresTimer.unref?.()
+
     this.sessions.set(state, session)
+    this.waitForDesktopCallback(session)
     return session
   }
 
@@ -129,6 +194,7 @@ export class HahaOpenAIOAuthService {
     const s = this.sessions.get(state)
     if (!s) return null
     if (Date.now() - s.createdAt > SESSION_TTL_MS) {
+      this.closeSession(s)
       this.sessions.delete(state)
       return null
     }
@@ -137,15 +203,77 @@ export class HahaOpenAIOAuthService {
 
   consumeSession(state: string): OpenAIOAuthSession | null {
     const s = this.getSession(state)
-    if (s) this.sessions.delete(state)
+    if (s) {
+      this.clearSessionTimer(s)
+      this.sessions.delete(state)
+    }
     return s
   }
 
   private pruneExpiredSessions(): void {
     const now = Date.now()
     for (const [state, s] of this.sessions.entries()) {
-      if (now - s.createdAt > SESSION_TTL_MS) this.sessions.delete(state)
+      if (now - s.createdAt > SESSION_TTL_MS) {
+        this.closeSession(s)
+        this.sessions.delete(state)
+      }
     }
+  }
+
+  private waitForDesktopCallback(session: OpenAIOAuthSession): void {
+    const listener = session.authCodeListener
+    if (!listener) return
+
+    void listener
+      .waitForAuthorization(session.state, async () => {})
+      .then(async (authorizationCode) => {
+        try {
+          await this.completeSession(authorizationCode, session.state)
+          listener.handleSuccessRedirect([], (res) => {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+            res.end(HTML_SUCCESS)
+          })
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          listener.handleSuccessRedirect([], (res) => {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+            res.end(renderErrorHtml(message))
+          })
+        } finally {
+          this.closeSession(session)
+          this.sessions.delete(session.state)
+        }
+      })
+      .catch((err) => {
+        if (this.sessions.get(session.state) === session) {
+          this.closeSession(session)
+          this.sessions.delete(session.state)
+        }
+        console.error(
+          '[HahaOpenAIOAuthService] OAuth callback listener failed:',
+          err instanceof Error ? err.message : err,
+        )
+      })
+  }
+
+  private clearSessionTimer(session: OpenAIOAuthSession): void {
+    if (session.expiresTimer) {
+      clearTimeout(session.expiresTimer)
+      session.expiresTimer = undefined
+    }
+  }
+
+  private closeSession(session: OpenAIOAuthSession): void {
+    this.clearSessionTimer(session)
+    session.authCodeListener?.close()
+    session.authCodeListener = undefined
+  }
+
+  dispose(): void {
+    for (const session of this.sessions.values()) {
+      this.closeSession(session)
+    }
+    this.sessions.clear()
   }
 
   async completeSession(
@@ -157,10 +285,9 @@ export class HahaOpenAIOAuthService {
       throw new Error('OpenAI OAuth session not found or expired')
     }
 
-    const redirectUri = `http://localhost:${session.serverPort}${OPENAI_CODEX_REDIRECT_PATH}`
     const response = await exchangeOpenAICodeForTokens({
       code: authorizationCode,
-      redirectUri,
+      redirectUri: session.redirectUri,
       codeVerifier: session.codeVerifier,
     })
 
