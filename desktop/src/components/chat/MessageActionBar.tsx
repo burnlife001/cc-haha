@@ -52,6 +52,7 @@ export function MessageActionBar({
             label={copyLabel}
             displayLabel={<Copy size={13} strokeWidth={2.2} aria-hidden="true" />}
             displayCopiedLabel={<Check size={13} strokeWidth={2.4} aria-hidden="true" />}
+            onPointerUp={(event) => event.currentTarget.blur()}
             className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-transparent bg-transparent text-[var(--color-text-tertiary)] transition-colors hover:border-[var(--color-brand)]/30 hover:bg-[var(--color-surface-container-low)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35"
           />
         ) : null}
@@ -62,6 +63,7 @@ export function MessageActionBar({
             disabled={branchAction.loading}
             aria-label={branchAction.label}
             title={branchAction.label}
+            onPointerUp={(event) => event.currentTarget.blur()}
             className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-transparent bg-transparent text-[var(--color-text-tertiary)] transition-colors hover:border-[var(--color-brand)]/30 hover:bg-[var(--color-surface-container-low)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35 disabled:cursor-wait disabled:opacity-60"
           >
             <GitFork size={13} strokeWidth={2.2} aria-hidden="true" />

@@ -1580,6 +1580,33 @@ describe('MessageList nested tool calls', () => {
     )
   })
 
+  it('releases pointer focus from message actions after clicking copy', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'assistant-1',
+              type: 'assistant_text',
+              content: '离开 hover 后操作条应该恢复隐藏。',
+              timestamp: 1,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    const copyButton = screen.getByRole('button', { name: 'Copy reply' })
+    copyButton.focus()
+    expect(document.activeElement).toBe(copyButton)
+
+    fireEvent.pointerUp(copyButton)
+
+    expect(document.activeElement).not.toBe(copyButton)
+  })
+
   it('adds selected user message text to the composer context', async () => {
     useChatStore.setState({
       sessions: {
