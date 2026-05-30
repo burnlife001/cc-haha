@@ -1798,7 +1798,6 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
           <CurrentTurnChangeCard
             key={`turn-change-${card.target.messageId}`}
             sessionId={resolvedSessionId}
-            targetUserMessageId={card.checkpoint.target.targetUserMessageId}
             checkpoint={card.checkpoint}
             workDir={card.workDir}
             error={turnActionErrors[card.target.messageId] ?? null}

@@ -14,13 +14,6 @@ const { openPreviewSpy, browserOpenSpy, openTargetSpy, ensureTargetsMock } = vi.
   return { openPreviewSpy, browserOpenSpy, openTargetSpy, ensureTargetsMock }
 })
 
-// Mock sessionsApi so diff calls don't run
-vi.mock('../../api/sessions', () => ({
-  sessionsApi: {
-    getTurnCheckpointDiff: vi.fn().mockResolvedValue({ state: 'ok', diff: '--- a\n+++ b\n@@ -0,0 +1 @@\n+hello' }),
-  },
-}))
-
 // Mock openTargetStore
 vi.mock('../../stores/openTargetStore', () => ({
   useOpenTargetStore: Object.assign(
@@ -120,7 +113,6 @@ function renderCard(filesChanged: string[]) {
   return render(
     <CurrentTurnChangeCard
       sessionId="s1"
-      targetUserMessageId="msg-1"
       checkpoint={checkpoint}
       workDir="/w/proj"
       error={null}
@@ -164,6 +156,46 @@ describe('CurrentTurnChangeCard – rich file row (icon / name / type)', () => {
   })
 })
 
+describe('CurrentTurnChangeCard – row opens the workspace diff', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ensureTargetsMock.mockResolvedValue(undefined)
+    openPreviewSpy.mockResolvedValue(undefined)
+  })
+
+  it('clicking a file row calls openPreview(sessionId, displayPath, "diff")', () => {
+    renderCard(['/w/proj/src/main.ts'])
+    const row = screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })
+    fireEvent.click(row)
+    // displayPath is the workDir-relative path (matches the workspace file tree)
+    expect(openPreviewSpy).toHaveBeenCalledWith('s1', 'src/main.ts', 'diff')
+  })
+
+  it('passes the workDir-relative displayPath (not the absolute path) to openPreview', () => {
+    renderCard(['/w/proj/README.md'])
+    const row = screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })
+    fireEvent.click(row)
+    expect(openPreviewSpy).toHaveBeenCalledWith('s1', 'README.md', 'diff')
+  })
+
+  it('does NOT render an inline diff surface after clicking a row', () => {
+    renderCard(['/w/proj/src/main.ts'])
+    const row = screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })
+    fireEvent.click(row)
+    // No inline diff is rendered inside the card anymore — the diff opens in the
+    // right-side workspace panel instead.
+    expect(screen.queryByText('chat.turnChangesDiffLoading')).not.toBeInTheDocument()
+    expect(screen.queryByText('chat.turnChangesDiffUnavailable')).not.toBeInTheDocument()
+    // The CodeMirror diff surface (.cm-editor) is never mounted in the card.
+    expect(document.querySelector('.cm-editor')).toBeNull()
+  })
+
+  it('each file row exposes a single "open in workspace" button (no expand/collapse toggle)', () => {
+    renderCard(['/w/proj/README.md', '/w/proj/src/index.ts'])
+    expect(screen.getAllByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })).toHaveLength(2)
+  })
+})
+
 describe('CurrentTurnChangeCard – open-with buttons', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -178,11 +210,11 @@ describe('CurrentTurnChangeCard – open-with buttons', () => {
     expect(buttons).toHaveLength(2)
   })
 
-  it('does NOT render an "open-with" button for a source file (diff toggle stays)', () => {
+  it('does NOT render an "open-with" button for a source file (row still opens workspace)', () => {
     renderCard(['/w/proj/src/main.ts'])
     expect(screen.queryAllByRole('button', { name: 'openWith.title' })).toHaveLength(0)
-    // source files keep their inline diff toggle — only the open-with pill is dropped
-    expect(screen.getByRole('button', { name: /turnChangesShowDiffAria/ })).toBeInTheDocument()
+    // source files keep their workspace-open row — only the open-with pill is dropped
+    expect(screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })).toBeInTheDocument()
   })
 
   it('mixed turn: only previewable rows (md/html) get the open-with button, not .ts', () => {
@@ -240,15 +272,16 @@ describe('CurrentTurnChangeCard – open-with buttons', () => {
     expect(ensureTargetsMock).toHaveBeenCalledTimes(1)
   })
 
-  it('diff-toggle button still works (not nested button regression)', async () => {
+  it('open-with button does not also trigger the row workspace-open (stopPropagation)', async () => {
     renderCard(['/w/proj/README.md'])
-    // The diff toggle has aria-label from the i18n key + path
-    const diffBtn = screen.getByRole('button', { name: /turnChangesShowDiffAria/ })
-    expect(diffBtn).toBeInTheDocument()
-    // Clicking should not throw
+    const [openWithBtn] = screen.getAllByRole('button', { name: 'openWith.title' })
+
     await act(async () => {
-      fireEvent.click(diffBtn)
+      fireEvent.click(openWithBtn!)
     })
+
+    // The diff open (3rd arg 'diff') must not have fired from clicking the pill.
+    expect(openPreviewSpy).not.toHaveBeenCalledWith('s1', 'README.md', 'diff')
   })
 })
 
@@ -265,15 +298,15 @@ describe('CurrentTurnChangeCard – collapse long file lists', () => {
 
   it('does NOT render a show-more toggle with ≤5 files', () => {
     renderCard(makeFiles(5))
-    expect(screen.getAllByRole('button', { name: /turnChangesShowDiffAria/ })).toHaveLength(5)
+    expect(screen.getAllByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })).toHaveLength(5)
     expect(screen.queryByText('chat.turnChangesShowMore')).not.toBeInTheDocument()
     expect(screen.queryByText('chat.turnChangesShowLess')).not.toBeInTheDocument()
   })
 
   it('with 8 files shows only 5 rows + a "show more" toggle (remaining = 3)', () => {
     renderCard(makeFiles(8))
-    // only the first 5 diff-toggle rows are rendered
-    expect(screen.getAllByRole('button', { name: /turnChangesShowDiffAria/ })).toHaveLength(5)
+    // only the first 5 workspace-open rows are rendered
+    expect(screen.getAllByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })).toHaveLength(5)
     // the show-more toggle is present (identity-mock key). The real key carries the
     // remaining count via '{count}'; with the placeholder-bearing real string this
     // renders as "再显示 3 个文件" (8 - COLLAPSED_COUNT(5) = 3).
@@ -287,13 +320,13 @@ describe('CurrentTurnChangeCard – collapse long file lists', () => {
     const showMore = screen.getByText('chat.turnChangesShowMore')
 
     fireEvent.click(showMore)
-    expect(screen.getAllByRole('button', { name: /turnChangesShowDiffAria/ })).toHaveLength(8)
+    expect(screen.getAllByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })).toHaveLength(8)
     const showLess = screen.getByText('chat.turnChangesShowLess')
     expect(showLess).toBeInTheDocument()
     expect(screen.queryByText('chat.turnChangesShowMore')).not.toBeInTheDocument()
 
     fireEvent.click(showLess)
-    expect(screen.getAllByRole('button', { name: /turnChangesShowDiffAria/ })).toHaveLength(5)
+    expect(screen.getAllByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })).toHaveLength(5)
     expect(screen.getByText('chat.turnChangesShowMore')).toBeInTheDocument()
   })
 })

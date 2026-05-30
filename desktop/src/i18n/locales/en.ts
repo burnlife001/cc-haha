@@ -1213,10 +1213,7 @@ export const en = {
   'chat.turnChangesHistoricalConfirmBody': 'This will rewind the conversation to before this turn and restore tracked files for that checkpoint.',
   'chat.turnChangesLatestConfirmUndo': 'Undo current turn',
   'chat.turnChangesHistoricalConfirmUndo': 'Rewind to before this turn',
-  'chat.turnChangesShowDiffAria': 'Show diff for {path}',
-  'chat.turnChangesHideDiffAria': 'Hide diff for {path}',
-  'chat.turnChangesDiffLoading': 'Loading diff...',
-  'chat.turnChangesDiffUnavailable': 'Diff unavailable.',
+  'chat.turnChangesOpenInWorkspaceAria': 'Open {path} in workspace',
   'chat.turnChangesShowMore': 'Show {count} more files',
   'chat.turnChangesShowLess': 'Show less',
 

@@ -1215,10 +1215,7 @@ export const zh: Record<TranslationKey, string> = {
   'chat.turnChangesHistoricalConfirmBody': '这会把会话回滚到这一轮之前，并恢复该检查点对应的文件变更。',
   'chat.turnChangesLatestConfirmUndo': '撤销当前轮次',
   'chat.turnChangesHistoricalConfirmUndo': '回滚到这一轮之前',
-  'chat.turnChangesShowDiffAria': '查看 {path} 的 diff',
-  'chat.turnChangesHideDiffAria': '收起 {path} 的 diff',
-  'chat.turnChangesDiffLoading': '正在加载 diff...',
-  'chat.turnChangesDiffUnavailable': 'Diff 不可用。',
+  'chat.turnChangesOpenInWorkspaceAria': '在工作区打开 {path}',
   'chat.turnChangesShowMore': '再显示 {count} 个文件',
   'chat.turnChangesShowLess': '收起',
 
