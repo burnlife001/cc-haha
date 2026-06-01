@@ -28,6 +28,26 @@ describe('chat blocks', () => {
     expect(container.querySelector('.thinking-inline-cursor')).toBeNull()
   })
 
+  it('renders collapsed thinking content as markdown', () => {
+    const { container } = render(<ThinkingBlock content={'**important**\n\n- item one'} />)
+
+    expect(container.querySelector('strong')?.textContent).toBe('important')
+    expect(container.querySelector('li')?.textContent).toBe('item one')
+  })
+
+  it('limits collapsed thinking content to ten lines until expanded', () => {
+    const content = Array.from({ length: 12 }, (_, index) => `line-${index + 1}`).join('\n')
+    const { container } = render(<ThinkingBlock content={content} />)
+
+    expect(container.textContent).toContain('line-10')
+    expect(container.textContent).not.toContain('line-11')
+
+    fireEvent.click(screen.getByRole('button', { name: /Thinking/ }))
+
+    expect(container.textContent).toContain('line-11')
+    expect(container.textContent).toContain('line-12')
+  })
+
   it('shows tool previews only after expanding the tool block', () => {
     const { container } = render(
       <ToolCallBlock

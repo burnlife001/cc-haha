@@ -1,27 +1,35 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useTranslation } from '../../i18n'
+import { MarkdownRenderer } from '../markdown/MarkdownRenderer'
+
+const PREVIEW_LINE_LIMIT = 10
 
 export function ThinkingBlock({ content, isActive = false }: { content: string; isActive?: boolean }) {
   const t = useTranslation()
   const [expanded, setExpanded] = useState(false)
   const contentRef = useRef<HTMLDivElement>(null)
+  const displayContent = useMemo(() => content.replace(/\r\n?/g, '\n').trimEnd(), [content])
+  const hasDisplayContent = displayContent.trim().length > 0
+  const displayLines = useMemo(() => displayContent.split('\n'), [displayContent])
+  const previewContent = useMemo(
+    () => displayLines.slice(0, PREVIEW_LINE_LIMIT).join('\n'),
+    [displayLines],
+  )
+  const isPreviewTruncated = displayLines.length > PREVIEW_LINE_LIMIT
 
   useEffect(() => {
     if (expanded && isActive && contentRef.current) {
       contentRef.current.scrollTop = contentRef.current.scrollHeight
     }
-  }, [content, expanded, isActive])
-
-  // Preview: take first meaningful line, not first 140 chars
-  const lines = content.split('\n').filter((l) => l.trim())
-  const firstLine = lines[0]?.replace(/\s+/g, ' ').trim() || ''
-  const preview = firstLine.length > 80 ? firstLine.slice(0, 80) + '...' : firstLine
+  }, [displayContent, expanded, isActive])
 
   return (
     <div className="mb-1">
       <style>{thinkingStyles}</style>
       <button
+        type="button"
         onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
         className="flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[12px] text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-text-secondary)]"
       >
         <span className="text-[10px] text-[var(--color-outline)]">
@@ -31,20 +39,30 @@ export function ThinkingBlock({ content, isActive = false }: { content: string; 
           {t('thinking.label')}
           {isActive && <span className="thinking-dots" />}
         </span>
-        {!expanded && preview && (
-          <span className="min-w-0 flex-1 truncate font-[var(--font-mono)] text-[11px] text-[var(--color-text-tertiary)]">
-            {preview}
-            {isActive && <span className="thinking-inline-cursor" />}
-          </span>
-        )}
       </button>
-      {expanded && (
+      {hasDisplayContent && (
         <div
-          ref={contentRef}
-          className="mt-1 max-h-[300px] overflow-y-auto rounded-lg border border-[var(--color-border)]/40 bg-[var(--color-surface-container-lowest)] p-2.5 font-[var(--font-mono)] text-[11px] leading-[1.35] text-[var(--color-text-secondary)] whitespace-pre-wrap break-words"
+          ref={expanded ? contentRef : undefined}
+          data-thinking-content={expanded ? 'expanded' : 'collapsed'}
+          data-thinking-truncated={!expanded && isPreviewTruncated ? 'true' : undefined}
+          onClick={!expanded ? () => setExpanded(true) : undefined}
+          className={`relative mt-1 rounded-lg border border-[var(--color-border)]/40 bg-[var(--color-surface-container-lowest)] p-2.5 text-[11px] text-[var(--color-text-secondary)] ${
+            expanded
+              ? 'max-h-[300px] overflow-y-auto'
+              : 'thinking-preview-clamp cursor-pointer'
+          }`}
         >
-          {content}
-          {isActive && expanded && <span className="thinking-cursor" />}
+          <MarkdownRenderer
+            content={expanded ? displayContent : previewContent}
+            variant="compact"
+            cache={!isActive}
+            streaming={isActive}
+            className="thinking-markdown text-[var(--color-text-secondary)]"
+          />
+          {!expanded && isPreviewTruncated && <span className="thinking-preview-fade" aria-hidden="true" />}
+          {isActive && (
+            <span className={expanded ? 'thinking-cursor' : 'thinking-inline-cursor thinking-preview-active-cursor'} />
+          )}
         </div>
       )}
     </div>
@@ -83,5 +101,33 @@ const thinkingStyles = `
 .thinking-dots::after {
   content: '';
   animation: thinking-dots 1.4s steps(1, end) infinite;
+}
+.thinking-markdown > :first-child,
+.thinking-markdown > :first-child > :first-child {
+  margin-top: 0;
+}
+.thinking-markdown > :last-child,
+.thinking-markdown > :last-child > :last-child {
+  margin-bottom: 0;
+}
+.thinking-preview-clamp {
+  max-height: calc(${PREVIEW_LINE_LIMIT} * 1.25rem + 1.25rem);
+  overflow: hidden;
+}
+.thinking-preview-fade {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1.75rem;
+  border-bottom-left-radius: 0.5rem;
+  border-bottom-right-radius: 0.5rem;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, var(--color-surface-container-lowest));
+}
+.thinking-preview-active-cursor {
+  position: absolute;
+  right: 0.6rem;
+  bottom: 0.45rem;
 }
 `
