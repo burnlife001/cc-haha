@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-REPO_ROOT="$(builtin cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null 2>&1 && pwd -P)"
+SCRIPT_DIR="$(builtin cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null 2>&1 && pwd -P)"
+REPO_ROOT="$(builtin cd "$SCRIPT_DIR/.." > /dev/null 2>&1 && pwd -P)"
 cd "$REPO_ROOT"
 
 # ── Configurable remotes ─────────────────────────────────────────────────────

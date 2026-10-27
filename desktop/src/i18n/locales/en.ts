@@ -601,6 +601,7 @@ export const en = {
   "publicAccess.customUrl": "Public HTTPS address",
   "publicAccess.customHint": "Use a stable address from Cloudflare Tunnel, frp or your reverse proxy. App and H5 pairing both work.",
   "publicAccess.customUrlError": "Enter an HTTPS address with no path, query, fragment or sign-in credentials.",
+  "publicAccess.customOriginSyncHint": "Enabling automatically adds this address to the H5 access allowed origins. It takes effect immediately — no server restart needed.",
   "publicAccess.localTarget": "Forward to this computer",
   "publicAccess.localTargetHint": "Point your tunnel to this restricted gateway. Keep the Origin header and WebSocket support; do not forward the main desktop service port.",
   "publicAccess.copyTarget": "Copy target",

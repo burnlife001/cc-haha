@@ -602,6 +602,7 @@ export const jp: Record<TranslationKey, string> = {
   "publicAccess.customUrl": "公開 HTTPS アドレス",
   "publicAccess.customHint": "Cloudflare Tunnel、frp、リバースプロキシの固定アドレスを入力します。スマートフォンアプリと H5 の両方でペアリングできます。",
   "publicAccess.customUrlError": "パス、クエリ、フラグメント、ログイン情報を含まない HTTPS アドレスを入力してください。",
+  "publicAccess.customOriginSyncHint": "有効化すると、このアドレスが H5 アクセスの許可済みオリジンに自動追加されます。即時反映され、サーバーの再起動は不要です。",
   "publicAccess.localTarget": "このコンピューターへの転送先",
   "publicAccess.localTargetHint": "制限付きゲートウェイに転送し、Origin ヘッダーと WebSocket を維持してください。デスクトップのメインサービスポートには転送しないでください。",
   "publicAccess.copyTarget": "転送先をコピー",

@@ -600,6 +600,7 @@ export const zh: Record<TranslationKey, string> = {
   "publicAccess.customUrl": "公网 HTTPS 地址",
   "publicAccess.customHint": "填写 Cloudflare Tunnel、frp 或反向代理提供的固定地址，手机 App 和 H5 都可扫码配对。",
   "publicAccess.customUrlError": "请输入 HTTPS 地址，不包含路径、查询参数、片段或登录凭据。",
+  "publicAccess.customOriginSyncHint": "启用时会自动把该地址加入 H5 访问的允许来源，立即生效，无需重启服务。",
   "publicAccess.localTarget": "转发到本机",
   "publicAccess.localTargetHint": "将隧道指向这个受限网关，保留 Origin 请求头并支持 WebSocket；不要转发桌面主服务端口。",
   "publicAccess.copyTarget": "复制转发目标",

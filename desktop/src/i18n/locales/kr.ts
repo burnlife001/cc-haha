@@ -604,6 +604,7 @@ export const kr: Record<TranslationKey, string> = {
   "publicAccess.customUrl": "공개 HTTPS 주소",
   "publicAccess.customHint": "Cloudflare Tunnel, frp 또는 리버스 프록시의 고정 주소를 입력하세요. 휴대폰 앱과 H5 모두 페어링할 수 있습니다.",
   "publicAccess.customUrlError": "경로, 쿼리, 프래그먼트 또는 로그인 정보가 없는 HTTPS 주소를 입력하세요.",
+  "publicAccess.customOriginSyncHint": "활성화하면 이 주소가 H5 접근 허용 출처에 자동으로 추가됩니다. 즉시 적용되며 서버 재시작이 필요 없습니다.",
   "publicAccess.localTarget": "이 컴퓨터로 전달",
   "publicAccess.localTargetHint": "터널이 이 제한된 게이트웨이로 연결되도록 하고 Origin 헤더와 WebSocket을 유지하세요. 데스크톱 기본 서비스 포트로 전달하지 마세요.",
   "publicAccess.copyTarget": "전달 대상 복사",

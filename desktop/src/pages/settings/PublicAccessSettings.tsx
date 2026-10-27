@@ -18,6 +18,7 @@ import {
 } from '@/components/settings/SettingsSection'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { useTranslation } from '@/i18n'
+import { useSettingsStore } from '@/stores/settingsStore'
 
 export function PublicAccessSettings() {
   const t = useTranslation()
@@ -26,7 +27,7 @@ export function PublicAccessSettings() {
   const [status, setStatus] = useState<Awaited<ReturnType<typeof bridge.getStatus>> | null>(null)
   const [server, setServer] = useState<PublicAccessServerStatus | null>(null)
   const [token, setToken] = useState('')
-  const [mode, setMode] = useState<'ngrok' | 'custom'>('ngrok')
+  const [mode, setMode] = useState<'ngrok' | 'custom'>('custom')
   const [customUrl, setCustomUrl] = useState('')
   const [ngrokDomain, setNgrokDomain] = useState('')
   const [localPort, setLocalPort] = useState(String(DEFAULT_PUBLIC_ACCESS_PORT))
@@ -54,7 +55,7 @@ export function PublicAccessSettings() {
         if (active && generation === actionGeneration.current && sequence === refreshSequence.current) {
           if (!initialized.current) {
             initialized.current = true
-            setMode(next.mode ?? 'ngrok')
+            setMode(next.mode ?? 'custom')
             setCustomUrl(next.customUrl ?? '')
             setNgrokDomain(next.ngrokDomain ?? '')
             setLocalPort(String(next.localPort ?? DEFAULT_PUBLIC_ACCESS_PORT))
@@ -139,7 +140,30 @@ export function PublicAccessSettings() {
     customUrl: mode === 'custom' ? normalizedUrl : status?.customUrl ?? '',
     localPort: mode === 'custom' ? port : status?.localPort ?? DEFAULT_PUBLIC_ACCESS_PORT,
   }
-  const configurationChanged = configuration.ngrokDomain !== (status?.ngrokDomain ?? '') || configuration.mode !== (status?.mode ?? 'ngrok') || configuration.customUrl !== (status?.customUrl ?? '') || configuration.localPort !== (status?.localPort ?? DEFAULT_PUBLIC_ACCESS_PORT)
+  const configurationChanged = configuration.ngrokDomain !== (status?.ngrokDomain ?? '') || configuration.mode !== (status?.mode ?? 'custom') || configuration.customUrl !== (status?.customUrl ?? '') || configuration.localPort !== (status?.localPort ?? DEFAULT_PUBLIC_ACCESS_PORT)
+  const syncTunnelOriginToH5AllowedOrigins = async () => {
+    if (mode !== 'custom' || !normalizedUrl) return
+    let origin: string
+    try {
+      origin = new URL(normalizedUrl).origin
+    } catch {
+      return
+    }
+    try {
+      // H5 settings are read from disk per request server-side, so this takes
+      // effect immediately — no server restart needed.
+      await useSettingsStore.getState().fetchH5Access()
+      // A failed load falls back to stale in-memory settings; writing those
+      // back could clobber origins added elsewhere, so skip the update.
+      if (useSettingsStore.getState().h5AccessError) return
+      const current = useSettingsStore.getState().h5Access.allowedOrigins
+      if (current.includes(origin)) return
+      await useSettingsStore.getState().updateH5AccessSettings({ allowedOrigins: [...current, origin] })
+    } catch {
+      // Best-effort: public access itself works without it; only the H5 page
+      // served through the tunnel needs the origin in allowedOrigins.
+    }
+  }
   const start = () => run(async (generation) => {
     if (!validConfiguration) return
     setConsent(false)
@@ -156,6 +180,8 @@ export function PublicAccessSettings() {
       if (generation !== actionGeneration.current) return
       setToken('')
     }
+    await syncTunnelOriginToH5AllowedOrigins()
+    if (generation !== actionGeneration.current) return
     setQr(null)
     setExpiresAt(null)
     pendingPairing.current = true
@@ -261,6 +287,9 @@ export function PublicAccessSettings() {
         </SettingsRow>
         {customUrl && !normalizedUrl && <SettingsBlock>
           <p id="public-access-url-error" role="alert" className="text-xs text-[var(--color-error)]">{t('publicAccess.customUrlError')}</p>
+        </SettingsBlock>}
+        {normalizedUrl && <SettingsBlock>
+          <p className="text-xs leading-[1.5] text-[var(--color-text-tertiary)]">{t('publicAccess.customOriginSyncHint')}</p>
         </SettingsBlock>}
         <SettingsRow title={t('publicAccess.localTarget')} description={t('publicAccess.localTargetHint')}>
           <code className="break-all text-xs text-[var(--color-text-primary)]">{validPort ? `http://127.0.0.1:${port}` : '—'}</code>

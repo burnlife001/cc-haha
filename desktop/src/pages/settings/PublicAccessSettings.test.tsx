@@ -38,6 +38,7 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.clearAllMocks() })
 it('requires privacy consent before saving a masked credential and starting', async () => {
   render(<PublicAccessSettings />)
+  fireEvent.change(await screen.findByRole('combobox', { name: 'Connection method' }), { target: { value: 'ngrok' } })
   const input = screen.getByLabelText('ngrok Authtoken')
   expect(input).toHaveAttribute('type', 'password')
   fireEvent.change(input, { target: { value: 'private-token' } })
@@ -102,6 +103,7 @@ it('restores a saved custom gateway without requiring an ngrok account', async (
 it('opens only the official account page', async () => {
   mocks.open.mockResolvedValue(undefined)
   render(<PublicAccessSettings />)
+  fireEvent.change(await screen.findByRole('combobox', { name: 'Connection method' }), { target: { value: 'ngrok' } })
   fireEvent.click(screen.getByRole('button', { name: 'Get ngrok Authtoken' }))
   await waitFor(() => expect(mocks.open).toHaveBeenCalledWith('https://dashboard.ngrok.com/get-started/your-authtoken'))
 })
@@ -182,6 +184,7 @@ it('uses an expiring fragment QR and revokes only the selected device', async ()
 it('shows a retryable error without leaking upstream details', async () => {
   mocks.saveCredential.mockRejectedValueOnce(new Error('secret-private-token'))
   render(<PublicAccessSettings />)
+  fireEvent.change(await screen.findByRole('combobox', { name: 'Connection method' }), { target: { value: 'ngrok' } })
   fireEvent.change(screen.getByLabelText('ngrok Authtoken'), { target: { value: 'private-token' } })
   await waitFor(() => expect(screen.getByRole('button', { name: 'Enable public access' })).not.toBeDisabled())
   fireEvent.click(screen.getByRole('button', { name: 'Enable public access' }))
@@ -192,7 +195,7 @@ it('shows a retryable error without leaking upstream details', async () => {
 })
 
 it('allows closing a tunnel while SDK start is pending', async () => {
-  const connecting = { state: 'connecting', hasCredential: true, publicUrl: null, error: null, autoStart: false, consentVersion: PUBLIC_ACCESS_CONSENT_VERSION }
+  const connecting = { state: 'connecting', hasCredential: true, publicUrl: null, error: null, autoStart: false, consentVersion: PUBLIC_ACCESS_CONSENT_VERSION, mode: 'ngrok' }
   const disabled = { ...connecting, state: 'disabled' }
   mocks.getStatus.mockResolvedValue(disabled)
   let finishStart!: () => void
@@ -282,4 +285,56 @@ it('saves an explicitly assigned ngrok domain before starting the tunnel', async
   fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Agree and enable public access' }))
   await waitFor(() => expect(mocks.configure).toHaveBeenCalledWith({ mode: 'ngrok', customUrl: '', localPort: 17463, ngrokDomain: 'https://my-reserved.ngrok.app' }))
   await screen.findByAltText('Scan to pair this phone')
+})
+
+it('defaults the connection method to an existing HTTPS tunnel when none was saved', async () => {
+  mocks.getStatus.mockResolvedValue({ ...mocks.status, mode: null })
+  render(<PublicAccessSettings />)
+  const method = await screen.findByRole('combobox', { name: 'Connection method' })
+  await waitFor(() => expect(method).toHaveValue('custom'))
+})
+
+it('adds the tunnel origin to H5 allowed origins when enabling an existing HTTPS tunnel', async () => {
+  mocks.getStatus.mockResolvedValue({ ...mocks.status, mode: 'custom', customUrl: 'https://phone.example.com', state: 'disabled', consentVersion: PUBLIC_ACCESS_CONSENT_VERSION })
+  const fetchH5Access = vi.spyOn(useSettingsStore.getState(), 'fetchH5Access').mockResolvedValue(undefined)
+  const updateH5AccessSettings = vi.spyOn(useSettingsStore.getState(), 'updateH5AccessSettings').mockResolvedValue(undefined)
+  useSettingsStore.setState({ h5AccessError: null, h5Access: { ...useSettingsStore.getState().h5Access, allowedOrigins: ['https://existing.example.com'] } })
+  render(<PublicAccessSettings />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Enable public access' }))
+  await screen.findByAltText('Scan to pair this phone')
+  expect(fetchH5Access).toHaveBeenCalled()
+  expect(updateH5AccessSettings).toHaveBeenCalledWith({ allowedOrigins: ['https://existing.example.com', 'https://phone.example.com'] })
+})
+
+it('does not rewrite H5 allowed origins when the tunnel origin is already listed', async () => {
+  mocks.getStatus.mockResolvedValue({ ...mocks.status, mode: 'custom', customUrl: 'https://phone.example.com', state: 'disabled', consentVersion: PUBLIC_ACCESS_CONSENT_VERSION })
+  vi.spyOn(useSettingsStore.getState(), 'fetchH5Access').mockResolvedValue(undefined)
+  const updateH5AccessSettings = vi.spyOn(useSettingsStore.getState(), 'updateH5AccessSettings').mockResolvedValue(undefined)
+  useSettingsStore.setState({ h5AccessError: null, h5Access: { ...useSettingsStore.getState().h5Access, allowedOrigins: ['https://phone.example.com'] } })
+  render(<PublicAccessSettings />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Enable public access' }))
+  await screen.findByAltText('Scan to pair this phone')
+  expect(updateH5AccessSettings).not.toHaveBeenCalled()
+})
+
+it('skips the H5 origin sync entirely for the ngrok connection method', async () => {
+  mocks.getStatus.mockResolvedValue({ ...mocks.status, state: 'disabled', hasCredential: true, consentVersion: PUBLIC_ACCESS_CONSENT_VERSION })
+  const fetchH5Access = vi.spyOn(useSettingsStore.getState(), 'fetchH5Access').mockResolvedValue(undefined)
+  const updateH5AccessSettings = vi.spyOn(useSettingsStore.getState(), 'updateH5AccessSettings').mockResolvedValue(undefined)
+  render(<PublicAccessSettings />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Enable public access' }))
+  await screen.findByAltText('Scan to pair this phone')
+  expect(fetchH5Access).not.toHaveBeenCalled()
+  expect(updateH5AccessSettings).not.toHaveBeenCalled()
+})
+
+it('still starts the tunnel when the H5 origin sync fails', async () => {
+  mocks.getStatus.mockResolvedValue({ ...mocks.status, mode: 'custom', customUrl: 'https://phone.example.com', state: 'disabled', consentVersion: PUBLIC_ACCESS_CONSENT_VERSION })
+  vi.spyOn(useSettingsStore.getState(), 'fetchH5Access').mockRejectedValue(new Error('settings offline'))
+  const updateH5AccessSettings = vi.spyOn(useSettingsStore.getState(), 'updateH5AccessSettings').mockResolvedValue(undefined)
+  render(<PublicAccessSettings />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Enable public access' }))
+  await screen.findByAltText('Scan to pair this phone')
+  expect(updateH5AccessSettings).not.toHaveBeenCalled()
+  expect(mocks.start).toHaveBeenCalledWith(PUBLIC_ACCESS_CONSENT_VERSION)
 })

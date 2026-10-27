@@ -5,7 +5,7 @@
 ; port-scoped rule, create inbound allow rules scoped to the installed
 ; executables (main app + bundled claude-sidecar binaries); Windows matches
 ; the rule to whatever port those programs listen on. Scope is LocalSubnet,
-; mirroring the manual fix-cc-haha-h5(admin).ps1 helper.
+; mirroring the manual __scripts/fix-cc-haha-h5-admin.ps1 helper.
 ;
 ; Best-effort by design: per-user installs run without administrator rights,
 ; and security software may block netsh, so a failure must never abort setup.
@@ -26,7 +26,7 @@
     Pop $R1
     ${If} $R0 != 0
       DetailPrint "Firewall rule was not created for ${_PROGRAM} (netsh exit $R0): $R1"
-      DetailPrint "Administrator rights are required; run fix-cc-haha-h5(admin).ps1 as administrator to set it up later."
+      DetailPrint "Administrator rights are required; run __scripts/fix-cc-haha-h5-admin.ps1 as administrator to set it up later."
     ${Else}
       DetailPrint "Firewall rule added: ${CC_HAHA_FW_RULE_NAME} -> ${_PROGRAM}"
     ${EndIf}
