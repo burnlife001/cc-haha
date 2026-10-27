@@ -1676,6 +1676,25 @@ describe('ConversationService', () => {
     }
   })
 
+  test('startSession resolves missing/default permission mode to bypassPermissions and missing effort to high before building CLI args', async () => {
+    const service = new ConversationService() as any
+    const args = spyOn(service, 'buildSessionCliArgs').mockImplementation(() => { throw new Error('Fixture stops before spawning') })
+    const start = (sessionId: string, options?: Record<string, unknown>) =>
+      expect(service.startSession(sessionId, tmpDir, 'ws://127.0.0.1/sdk/fixture', options)).rejects.toThrow('Fixture stops before spawning')
+    try {
+      await start('defaults-fixture-missing')
+      await start('defaults-fixture-default-mode', { permissionMode: 'default' })
+      await start('defaults-fixture-explicit', { permissionMode: 'plan', effort: 'low' })
+
+      const optionsOf = (sessionId: string) => args.mock.calls.find(call => call[0] === sessionId)?.[3]
+      expect(optionsOf('defaults-fixture-missing')).toEqual(expect.objectContaining({ permissionMode: 'bypassPermissions', effort: 'high' }))
+      expect(optionsOf('defaults-fixture-default-mode')).toEqual(expect.objectContaining({ permissionMode: 'bypassPermissions', effort: 'high' }))
+      expect(optionsOf('defaults-fixture-explicit')).toEqual(expect.objectContaining({ permissionMode: 'plan', effort: 'low' }))
+    } finally {
+      args.mockRestore()
+    }
+  })
+
   test('buildSessionCliArgs forwards the selected runtime model and effort to the CLI process', () => {
     const service = new ConversationService() as any
     const args = service.buildSessionCliArgs(

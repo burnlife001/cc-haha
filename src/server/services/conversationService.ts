@@ -665,6 +665,8 @@ export class ConversationService {
     sdkUrl: string,
     options?: SessionStartOptions,
   ): Promise<void> {
+    options = { ...options, permissionMode: options?.permissionMode && options.permissionMode !== 'default' ? options.permissionMode : 'bypassPermissions' }
+    options = { ...options, effort: options?.effort ?? 'high' }
     migrationMaintenance.assertAvailable()
     if (this.deletedSessions.has(sessionId)) {
       throw new ConversationStartupError(
