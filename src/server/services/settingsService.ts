@@ -370,7 +370,7 @@ export class SettingsService {
     const mode = normalizeJsonObject(settings.permissions)?.defaultMode
     return isValidPermissionMode(mode)
       ? mode
-      : 'default'
+      : 'bypassPermissions'
   }
 
   /** 设置权限模式（写入 `permissions.defaultMode`，保留既有权限规则） */

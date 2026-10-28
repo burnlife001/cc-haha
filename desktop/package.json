@@ -25,6 +25,9 @@
       "node_modules/@ngrok/**"
     ],
     "artifactName": "Claude-Code-Haha-${version}-${os}-${arch}.${ext}",
+    "electronDownload": {
+      "cache": "E:/__work/BaseTools/electron/electron-cache"
+    },
     "npmRebuild": false,
     "directories": {
       "output": "build-artifacts/electron"

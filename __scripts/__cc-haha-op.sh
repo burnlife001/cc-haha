@@ -90,6 +90,32 @@ sync_upstream() {
 
 # ── Build exe ────────────────────────────────────────────────────────────────
 build_exe() {
+  # 用本地已下载的 electron zip 预置 @electron/get 缓存，跳过慢速下载。
+  # 缓存结构: <electronDownload.cache>/<sha256(下载URL目录名)>/<zip文件名>
+  local electron_ver
+  electron_ver="$(node -p "require('$(cygpath -m "$REPO_ROOT")/desktop/node_modules/electron/package.json').version" 2>/dev/null)"
+  local zip_name="electron-v${electron_ver}-win32-x64.zip"
+  local src_zip="E:/__work/BaseTools/electron/${zip_name}"
+  if [ -f "$src_zip" ] && [ -n "$electron_ver" ]; then
+    local url_dir="https://github.com/electron/electron/releases/download/v${electron_ver}"
+    local hash
+    hash="$(node -e "console.log(require('crypto').createHash('sha256').update('$url_dir').digest('hex'))")"
+    local cache_root="E:/__work/BaseTools/electron/electron-cache"
+    local dst_zip="$cache_root/$hash/$zip_name"
+    mkdir -p "$cache_root/$hash"
+    rm -f "$dst_zip"
+    if ! MSYS=winsymlinks:nativestrict ln -s "$src_zip" "$dst_zip"; then
+      red "[build-exe] 创建 electron 缓存符号链接失败: $dst_zip -> $src_zip"
+      read -r -p "按回车继续..."
+      return 1
+    fi
+    green "[build-exe] electron 缓存就绪: $dst_zip"
+  else
+    red "[build-exe] 未找到本地 electron zip: $src_zip"
+    read -r -p "按回车继续..."
+    return 1
+  fi
+
   echo "[build-exe] Installing adapters dependencies..."
   (cd "$REPO_ROOT/adapters" && bun install)
   if [ $? -ne 0 ]; then
