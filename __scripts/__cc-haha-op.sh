@@ -24,13 +24,21 @@ backup_branch_only_files() {
   local base="$1" dest="$2" file
   mkdir -p "$dest"
   : > "$dest/.manifest"
-  git diff --name-only --diff-filter=A "$base" HEAD -- 2>/dev/null | while IFS= read -r file; do
+  # git diff 失败时必须报错：清单为空 = 备份失效 = 文件可能真丢
+  if ! git diff --name-only --diff-filter=A "$base" HEAD -- > "$dest/.files" 2>/dev/null; then
+    red "git diff 失败，无法列出分支独有文件。"
+    rm -f "$dest/.files"
+    return 1
+  fi
+  while IFS= read -r file; do
     [ -n "$file" ] || continue
-    [ -f "$file" ] || continue
+    [ -e "$file" ] || [ -L "$file" ] || continue
     mkdir -p "$dest/$(dirname "$file")"
-    cp -p "$file" "$dest/$file"
+    cp -Pp "$file" "$dest/$file"
     printf '%s\n' "$file" >> "$dest/.manifest"
-  done
+  done < "$dest/.files"
+  rm -f "$dest/.files"
+  return 0
 }
 
 restore_branch_only_files() {
@@ -38,12 +46,36 @@ restore_branch_only_files() {
   [ -f "$dest/.manifest" ] || return 0
   while IFS= read -r file; do
     [ -n "$file" ] || continue
-    if [ ! -e "$file" ] && [ -f "$dest/$file" ]; then
+    if [ ! -e "$file" ] && [ ! -L "$file" ] &&
+       { [ -e "$dest/$file" ] || [ -L "$dest/$file" ]; }; then
       mkdir -p "$(dirname "$file")"
-      cp -p "$dest/$file" "$file"
+      cp -Pp "$dest/$file" "$file"
       yellow "已还原被误删的文件: $file"
     fi
   done < "$dest/.manifest"
+}
+
+# 只有站在原分支上才允许把备份文件放回工作区：
+# 否则会把文件还原成 main 上的未跟踪文件，反而卡住之后的 checkout。
+restore_branch_only_files_if_on_branch() {
+  local dest="$1" branch="$2"
+  if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "$branch" ]; then
+    restore_branch_only_files "$dest"
+  else
+    yellow "当前不在 $branch 上，备份文件保留在: $dest"
+  fi
+}
+
+# 还原 stash；失败时明确告知（stash 仍留在列表里）
+restore_stash() {
+  local stashed="$1"
+  [ "$stashed" = true ] || return 0
+  echo "Restoring stashed changes..."
+  if ! git stash pop; then
+    red "stash pop 失败，stash 仍保留在列表里，请手动执行 git stash pop。"
+    return 1
+  fi
+  return 0
 }
 
 # ── Sync upstream ────────────────────────────────────────────────────────────
@@ -62,13 +94,21 @@ sync_upstream() {
 
   # 3. Stash if worktree is dirty (只统计已跟踪文件：未跟踪文件 stash push 存不了)
   local stashed=false
+  local stash_count_before
+  stash_count_before="$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
   if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then
     yellow "Worktree is dirty. Stashing changes..."
     if ! git stash push -m "auto: stash before sync $(date '+%Y-%m-%d %H:%M:%S')"; then
       red "stash 失败，同步已中止。"
       return 1
     fi
-    stashed=true
+    local stash_count_after
+    stash_count_after="$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$stash_count_after" -gt "$stash_count_before" ]; then
+      stashed=true
+    else
+      yellow "没有真正产生 stash（改动无法被 stash），继续同步。"
+    fi
   fi
 
   # 4. Determine original branch
@@ -82,9 +122,17 @@ sync_upstream() {
   if [ "$current_branch" = "main" ] && [ -z "$(echo "$all_branches" | grep -v '^main$')" ]; then
     local new_branch="feature/sync-$(date '+%Y%m%d')"
     yellow "Only main branch found. Creating new branch: $new_branch"
-    git checkout -b "$new_branch"
+    if ! git checkout -b "$new_branch"; then
+      red "创建分支 $new_branch 失败，同步已中止。"
+      restore_stash "$stashed" || true
+      return 1
+    fi
     git add -A
-    git commit -m "chore: initial commit on $new_branch"
+    if ! git commit -m "chore: initial commit on $new_branch"; then
+      red "初始提交失败，同步已中止。"
+      restore_stash "$stashed" || true
+      return 1
+    fi
     original_branch="$new_branch"
   else
     original_branch="$current_branch"
@@ -94,27 +142,45 @@ sync_upstream() {
   echo "[1/4] Fetching $UPSTREAM_REMOTE..."
   if ! git fetch "$UPSTREAM_REMOTE"; then
     red "fetch $UPSTREAM_REMOTE 失败，同步已中止。"
+    restore_stash "$stashed" || true
     return 1
   fi
 
   # 备份本分支独有文件（切分支时可能被删）
   local backup_dir
   backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/cc-haha-sync-XXXXXX")"
-  backup_branch_only_files main "$backup_dir"
+  if ! backup_branch_only_files main "$backup_dir"; then
+    red "备份分支独有文件失败，为安全起见中止同步。"
+    rm -rf "$backup_dir"
+    restore_stash "$stashed" || true
+    return 1
+  fi
 
   echo "[2/4] Checking out main and merging $UPSTREAM_REMOTE/main..."
   if ! git checkout main; then
-    red "切换到 main 失败（通常是目录被占用）。已切回 $original_branch 并还原备份文件。"
+    red "切换到 main 失败（通常是目录被占用）。"
     git reset --hard HEAD || true
-    git checkout "$original_branch" || true
-    restore_branch_only_files "$backup_dir"
+    if git checkout "$original_branch"; then
+      restore_branch_only_files "$backup_dir"
+      restore_stash "$stashed" || true
+    else
+      red "切回 $original_branch 也失败，请手动恢复。"
+      echo "  备份文件保留在: $backup_dir"
+      echo "  你的改动保留在 stash 里（git stash list 查看）"
+    fi
     return 1
   fi
   if ! git merge "$UPSTREAM_REMOTE/main" --no-edit; then
-    red "合并 $UPSTREAM_REMOTE/main 失败（多半是冲突）。已中止合并并切回 $original_branch。"
+    red "合并 $UPSTREAM_REMOTE/main 失败（多半是冲突）。已中止合并。"
     git merge --abort || true
-    git checkout "$original_branch" || true
-    restore_branch_only_files "$backup_dir"
+    if git checkout "$original_branch"; then
+      restore_branch_only_files "$backup_dir"
+      restore_stash "$stashed" || true
+    else
+      red "切回 $original_branch 失败，请手动恢复。"
+      echo "  备份文件保留在: $backup_dir"
+      echo "  你的改动保留在 stash 里（git stash list 查看）"
+    fi
     echo "  手动解决方式:"
     echo "    git checkout main && git merge $UPSTREAM_REMOTE/main"
     echo "    解决冲突后 git commit，再执行 git checkout $original_branch && git rebase main"
@@ -133,31 +199,34 @@ sync_upstream() {
   echo "[4/4] Rebasing $original_branch onto main..."
   if ! git checkout "$original_branch"; then
     red "切回 $original_branch 失败。"
-    restore_branch_only_files "$backup_dir"
+    echo "  备份文件保留在: $backup_dir"
+    echo "  你的改动保留在 stash 里（git stash list 查看）"
     return 1
   fi
   if ! git rebase main; then
     red "Rebase failed. Resolve conflicts, then run:"
-    echo "  git rebase --continue"
-    echo "  git stash pop  (if you had stashed changes)"
-    restore_branch_only_files "$backup_dir"
+    echo "  git rebase --continue   (或 git rebase --abort)"
+    echo "  git stash pop            (如果之前有 stash)"
+    # rebase 还在进行中：此时把备份文件放回工作区会变成未跟踪文件，
+    # 反而让 git rebase --continue 失败，所以只提示、不还原。
+    echo "  备份文件保留在: $backup_dir（rebase 完成后会随提交自动恢复，无需手动还原）"
     return 1
   fi
 
   # 8. Pop stash if we stashed
-  if [ "$stashed" = true ]; then
-    echo "Restoring stashed changes..."
-    if ! git stash pop; then
-      red "stash pop 失败，请手动执行 git stash pop。"
-    fi
-  fi
+  local stash_failed=false
+  restore_stash "$stashed" || stash_failed=true
 
   # 9. 兜底：确认本分支独有文件都还在
-  restore_branch_only_files "$backup_dir"
+  restore_branch_only_files_if_on_branch "$backup_dir" "$original_branch"
   rm -rf "$backup_dir"
 
   if [ "$push_failed" = true ]; then
     red "同步结束，但 main 未推送到 $ORIGIN_REMOTE。"
+    return 1
+  fi
+  if [ "$stash_failed" = true ]; then
+    red "同步结束，但 stash 未自动还原（见上方提示）。"
     return 1
   fi
 
