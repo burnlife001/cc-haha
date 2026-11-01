@@ -7,7 +7,7 @@ import { ConversationImageGalleryContext } from '@/components/chat/conversationI
 import { resolveConversationImages } from '@/components/chat/conversationImages'
 import { getServerBaseUrl } from '@/lib/desktopRuntime'
 import { useWorkspaceContentStore } from '@/stores/workspaceContentStore'
-import { useRef, useEffect, useMemo, memo, useState, useCallback, useDeferredValue, useLayoutEffect, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
+import { Component, useRef, useEffect, useMemo, memo, useState, useCallback, useDeferredValue, useLayoutEffect, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { createPortal, flushSync } from 'react-dom'
 import { ArrowDown, BookMarked, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, FileStack, LoaderCircle, Settings, Target, Undo2, XCircle } from 'lucide-react'
 import { ApiError } from '../../api/client'
@@ -19,6 +19,7 @@ import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextS
 import { useWorkspaceStore, type WorkspaceOrigin } from '../../stores/workspaceStore'
 import { SETTINGS_TAB_ID, useTabStore } from '../../stores/tabStore'
 import { teamTaskWindowsForSnapshot, useTeamStore } from '../../stores/teamStore'
+import { interruptedTeamNameOf, useTeamPlanStore } from '../../stores/teamPlanStore'
 import { useUIStore } from '../../stores/uiStore'
 import { useChatAppearanceStore } from '../../stores/chatAppearanceStore'
 import { t as translateNow, useTranslation } from '../../i18n'
@@ -48,6 +49,7 @@ import { WorkspaceChangesFallback } from '@/components/chat/WorkspaceChangesFall
 import { AgentTeamsInlineCard } from '../agentTeams/AgentTeamsSummary'
 import { MEMBER_AVATARS, memberAccentColor } from '../agentTeams/agentTeamsAvatars'
 import {
+  endedPhase,
   getMemberAvatarKey,
   resolveTeamMemberIdentity,
   snapshotWithHistoricalMembers,
@@ -111,6 +113,8 @@ type RenderItem =
       teamName: string
       startedAt: number
       endedAt?: number
+      /** Its lead deleted it, which it does once the work is done. */
+      deletedByLead?: boolean
       coordinationToolCalls: ToolCall[]
     }
 
@@ -130,6 +134,8 @@ type RewindTurnTarget = {
   messageId: string
   /** The prompt's own transcript id; a live prompt has none until history reloads. */
   transcriptMessageId?: string
+  /** The CLI never acknowledged this prompt, so the transcript may not hold it. */
+  awaitingReplay?: boolean
   userMessageIndex: number
   content: string
   expectedContent: string
@@ -1047,6 +1053,7 @@ export function buildRenderModel(
           const deletedTeamCard = ensureTeamCardForCoordination(msg, toolResult)
           if (deletedTeamCard) {
             deletedTeamCard.endedAt = msg.timestamp
+            deletedTeamCard.deletedByLead = true
             deletedTeamCard.coordinationToolCalls.push(msg)
             summarizedTeamDelete = true
           }
@@ -1114,6 +1121,10 @@ export function buildRenderModel(
         canSummarizeCoordinationResult(toolResult)
       ) {
         flushGroup()
+        // A lead leads one team at a time, so a new team means the previous
+        // one ended, even when the host ended it (a cancelled or ended plan)
+        // and no TeamDelete call here says so.
+        if (activeTeamCard && activeTeamCard.endedAt === undefined) activeTeamCard.endedAt = msg.timestamp
         activeTeamCard = {
           kind: 'team_card',
           id: `team-card-${msg.id}`,
@@ -1294,21 +1305,20 @@ function getBranchableMessageTargets(messages: UIMessage[]): Map<string, Brancha
   return branchableTargets
 }
 
-export function getCompletedTurnTargets(messages: UIMessage[]): RewindTurnTarget[] {
+function collectTurnTargets(messages: UIMessage[]): Array<{ target: RewindTurnTarget; answered: boolean }> {
   let userMessageIndex = -1
-  const completedTurns: RewindTurnTarget[] = []
+  const turns: Array<{ target: RewindTurnTarget; answered: boolean }> = []
   let currentTarget: RewindTurnTarget | null = null
   let hasResponseForCurrentTarget = false
 
   for (const message of messages) {
     if (message.type === 'user_text' && !message.pending) {
-      if (currentTarget && hasResponseForCurrentTarget) {
-        completedTurns.push(currentTarget)
-      }
+      if (currentTarget) turns.push({ target: currentTarget, answered: hasResponseForCurrentTarget })
       userMessageIndex += 1
       currentTarget = {
         messageId: message.id,
         ...(message.transcriptMessageId ? { transcriptMessageId: message.transcriptMessageId } : {}),
+        ...(message.awaitingReplay ? { awaitingReplay: true } : {}),
         userMessageIndex,
         content: message.content,
         expectedContent: message.modelContent ?? message.content,
@@ -1323,11 +1333,25 @@ export function getCompletedTurnTargets(messages: UIMessage[]): RewindTurnTarget
     }
   }
 
-  if (currentTarget && hasResponseForCurrentTarget) {
-    completedTurns.push(currentTarget)
-  }
+  if (currentTarget) turns.push({ target: currentTarget, answered: hasResponseForCurrentTarget })
+  return turns
+}
 
-  return completedTurns
+export function getCompletedTurnTargets(messages: UIMessage[]): RewindTurnTarget[] {
+  return collectTurnTargets(messages).filter((turn) => turn.answered).map((turn) => turn.target)
+}
+
+/**
+ * Prompts that never got a reply — a stop landed before the model answered.
+ * The model has no output to protect there, so these stay editable even though
+ * the server lists no checkpoint for a turn without a response.
+ */
+export function getUnansweredTurnTargets(
+  messages: UIMessage[],
+): Array<{ target: RewindTurnTarget; latest: boolean }> {
+  const turns = collectTurnTargets(messages)
+  return turns.flatMap((turn, index) =>
+    turn.answered ? [] : [{ target: turn.target, latest: index === turns.length - 1 }])
 }
 
 export function getLatestCompletedTurnTarget(messages: UIMessage[]): RewindTurnTarget | null {
@@ -1723,9 +1747,43 @@ export function isRenderItemFullyVisibleInChatScroller(renderItem: HTMLElement) 
     itemRect.right <= scrollerRect.right
 }
 
+type SessionScrollAnchor = {
+  itemKey: string
+  // CSS pixels relative to the scroller, including a partially clipped row.
+  offset: number
+}
+
 type SessionScrollSnapshot = {
   scrollTop: number
   wasAtBottom: boolean
+  anchor?: SessionScrollAnchor
+}
+
+type ScrollSnapshotBoundaryProps = {
+  sessionId: string | null | undefined
+  onLeave: () => void
+  children: ReactNode
+}
+
+// Read the outgoing DOM before React replaces it. A scroll event snapshot can
+// be stale after async layout; hook cleanups on updates run after DOM mutations.
+class ScrollSnapshotBoundary extends Component<ScrollSnapshotBoundaryProps> {
+  getSnapshotBeforeUpdate(previous: ScrollSnapshotBoundaryProps) {
+    if (previous.sessionId !== this.props.sessionId) previous.onLeave()
+    return null
+  }
+
+  componentDidUpdate() {
+    // React requires this lifecycle when getSnapshotBeforeUpdate is used.
+  }
+
+  componentWillUnmount() {
+    this.props.onLeave()
+  }
+
+  render() {
+    return this.props.children
+  }
 }
 
 type VirtualViewport = {
@@ -1778,9 +1836,19 @@ function rememberSessionScroll(sessionId: string, element: HTMLElement, wasAtBot
     }
   }
 
+  const containerTop = element.getBoundingClientRect().top
+  const firstVisibleRow = !wasAtBottom && [...element.querySelectorAll<HTMLElement>('[data-chat-render-item-key]')]
+    .find((row) => {
+      const rect = row.getBoundingClientRect()
+      return rect.height > 0 && rect.bottom > containerTop && rect.top < containerTop + element.clientHeight
+    })
   sessionScrollSnapshots.set(sessionId, {
     scrollTop: element.scrollTop,
     wasAtBottom,
+    anchor: firstVisibleRow ? {
+      itemKey: firstVisibleRow.dataset.chatRenderItemKey!,
+      offset: firstVisibleRow.getBoundingClientRect().top - containerTop,
+    } : undefined,
   })
 }
 
@@ -2267,6 +2335,7 @@ function buildVirtualTranscriptWindow(
   measuredHeights: Map<string, number>,
   viewport: VirtualViewport,
   overscanPx: number,
+  anchor?: SessionScrollAnchor | null,
 ): VirtualTranscriptWindow {
   const offsets = buildVirtualItemOffsets(itemKeys, metrics, measuredHeights)
   const totalHeight = offsets[renderItems.length] ?? 0
@@ -2283,7 +2352,13 @@ function buildVirtualTranscriptWindow(
 
   const viewportHeight = viewport.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT
   const maxScrollTop = Math.max(0, totalHeight - viewportHeight)
-  const scrollTop = clampNumber(viewport.scrollTop, 0, maxScrollTop)
+  const anchorIndex = anchor ? itemKeys.indexOf(anchor.itemKey) : -1
+  // Keep the saved row mounted even if its async content is temporarily shorter
+  // than the saved intra-row offset. DOM alignment below owns the final pixels.
+  const anchorTop = anchorIndex >= 0
+    ? offsets[anchorIndex]! + Math.min(-anchor!.offset, offsets[anchorIndex + 1]! - offsets[anchorIndex]! - 1)
+    : viewport.scrollTop
+  const scrollTop = clampNumber(anchorTop, 0, maxScrollTop)
   const windowTop = Math.max(0, scrollTop - overscanPx)
   const windowBottom = Math.min(totalHeight, scrollTop + viewportHeight + overscanPx)
   const startIndex = findVirtualStartIndex(offsets, windowTop)
@@ -2451,6 +2526,7 @@ export function MessageList({
   const activeTeamStartedAt = useTeamStore((s) => (
     resolvedSessionId ? s.activeTeamStartedAtBySession[resolvedSessionId] : undefined
   ))
+  const interruptedTeamName = useTeamPlanStore(interruptedTeamNameOf(resolvedSessionId))
   const teamSnapshot = useMemo(() => {
     const snapshots = teamWorkbench?.snapshots
     return snapshots?.length
@@ -2514,13 +2590,15 @@ export function MessageList({
   const messageListRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const scrollContentRef = useRef<HTMLDivElement>(null)
-  const [initialVirtualItemHeights] = useState(() =>
-    resolvedSessionId ? getHeightsForSession(resolvedSessionId, appearanceSignature) : new Map<string, number>(),
-  )
-  const virtualItemHeightsRef = useRef(initialVirtualItemHeights)
-  const virtualItemMetricCacheRef = useRef<Map<string, VirtualRenderItemMetric>>(
-    resolvedSessionId ? getMetricsForSession(resolvedSessionId) : new Map<string, VirtualRenderItemMetric>(),
-  )
+  // Select session caches during render, before child layout effects measure.
+  // Rebinding a shared ref in the parent effect writes the new rows into the
+  // outgoing session's cache and loses their initial measurements.
+  const virtualItemHeights = useMemo(() => resolvedSessionId
+    ? getHeightsForSession(resolvedSessionId)
+    : new Map<string, number>(), [resolvedSessionId])
+  const virtualItemMetricCache = useMemo(() => resolvedSessionId
+    ? getMetricsForSession(resolvedSessionId)
+    : new Map<string, VirtualRenderItemMetric>(), [resolvedSessionId])
   const liveFollowFrameRef = useRef<number | null>(null)
   const navigationHighlightTimerRef = useRef<number | null>(null)
   const workspaceOriginRestoreFrameRef = useRef<number | null>(null)
@@ -2530,6 +2608,7 @@ export function MessageList({
   const lastAutoScrollAtRef = useRef(0)
   const lastContentResizeFollowHeightRef = useRef<number | null>(null)
   const shouldAutoScrollRef = useRef(true)
+  const restoringScrollAnchorRef = useRef<SessionScrollAnchor | null>(null)
   const isProgrammaticScrollingRef = useRef(false)
   const ignoreProgrammaticScrollUntilRef = useRef(0)
   const ignoreProgrammaticScrollTopRef = useRef<number | null>(null)
@@ -2649,6 +2728,7 @@ export function MessageList({
   }, [])
 
   const scrollToBottom = useCallback(() => {
+    restoringScrollAnchorRef.current = null
     shouldAutoScrollRef.current = true
     isProgrammaticScrollingRef.current = true
     ignoreProgrammaticScrollUntilRef.current = performance.now() + 250
@@ -2717,13 +2797,13 @@ export function MessageList({
 
   const handleVirtualItemHeightChange = useCallback((itemKey: string, height: number, initial = false) => {
     const measuredHeight = clampNumber(height, VIRTUAL_MIN_ITEM_HEIGHT, VIRTUAL_MAX_ITEM_HEIGHT)
-    const previousHeight = virtualItemHeightsRef.current.get(itemKey)
+    const previousHeight = virtualItemHeights.get(itemKey)
     if (
       previousHeight !== undefined &&
       Math.abs(previousHeight - measuredHeight) <= RESIZE_OBSERVER_JITTER_MAX_DELTA_PX
     ) return
 
-    virtualItemHeightsRef.current.set(itemKey, measuredHeight)
+    virtualItemHeights.set(itemKey, measuredHeight)
     // A row changing height while the reader follows the tail moves the bottom.
     // Re-pin whatever caused it (a permission card, a reloaded transcript
     // measuring in after the reply, a tool result settling), not only live
@@ -2737,13 +2817,19 @@ export function MessageList({
     // offsets and restore the reading anchor in the same frame as the new height.
     if (initial) flushMeasuredHeightVersion()
     else flushSync(flushMeasuredHeightVersion)
-  }, [flushMeasuredHeightVersion, requestLiveFollow])
+  }, [flushMeasuredHeightVersion, requestLiveFollow, virtualItemHeights])
 
   const updateAutoScrollState = useCallback(() => {
     // Ignore scroll events triggered by our own programmatic scrolling to
     // prevent the jump-to-latest button from flickering during auto-scroll.
     const container = scrollContainerRef.current
     if (!container) return
+    if (restoringScrollAnchorRef.current) {
+      // Native anchoring/scroll clamping can emit scroll during remeasurement.
+      // Only an explicit reader action ends restoration, not a timer or resize.
+      syncVirtualViewportFromContainer(container)
+      return
+    }
     const matchesProgrammaticScrollTop =
       ignoreProgrammaticScrollTopRef.current !== null &&
       Math.abs(container.scrollTop - ignoreProgrammaticScrollTopRef.current) < 1
@@ -2793,6 +2879,7 @@ export function MessageList({
     const target = event.target
     if (!(target instanceof Element) || !target.closest(CHAT_DISCLOSURE_SELECTOR)) return
 
+    restoringScrollAnchorRef.current = null
     disclosureLayoutUntilRef.current = performance.now() + DISCLOSURE_FOLLOW_SUPPRESS_MS
 
     // Suppression only covers the resize frame. Once the block is open the
@@ -2813,6 +2900,7 @@ export function MessageList({
   }, [syncVirtualViewportFromContainer])
 
   const markUserScrollIntent = useCallback(() => {
+    restoringScrollAnchorRef.current = null
     userScrollIntentUntilRef.current = performance.now() + USER_SCROLL_INTENT_WINDOW_MS
   }, [])
 
@@ -2847,15 +2935,11 @@ export function MessageList({
   useLayoutEffect(() => {
     if (lastSessionIdRef.current !== resolvedSessionId) {
       const snapshot = resolvedSessionId ? sessionScrollSnapshots.get(resolvedSessionId) : undefined
+      restoringScrollAnchorRef.current = snapshot?.wasAtBottom ? null : snapshot?.anchor ?? null
       shouldAutoScrollRef.current = snapshot?.wasAtBottom ?? true
       lastSessionIdRef.current = resolvedSessionId
       setProgrammaticNavigationItemId(null)
-      virtualItemHeightsRef.current = resolvedSessionId
-        ? getHeightsForSession(resolvedSessionId, appearanceSignature)
-        : new Map<string, number>()
-      virtualItemMetricCacheRef.current = resolvedSessionId
-        ? getMetricsForSession(resolvedSessionId)
-        : new Map<string, VirtualRenderItemMetric>()
+      if (resolvedSessionId) getHeightsForSession(resolvedSessionId, appearanceSignature)
       lastContentResizeFollowHeightRef.current = null
       if (liveFollowFrameRef.current !== null) {
         cancelAnimationFrame(liveFollowFrameRef.current)
@@ -2865,9 +2949,11 @@ export function MessageList({
 
       const container = scrollContainerRef.current
       if (container && snapshot && !snapshot.wasAtBottom) {
-        ignoreProgrammaticScrollUntilRef.current = performance.now() + 250
-        ignoreProgrammaticScrollTopRef.current = snapshot.scrollTop
-        setScrollTopWithoutLayoutRead(container, snapshot.scrollTop)
+        if (!snapshot.anchor) {
+          ignoreProgrammaticScrollUntilRef.current = performance.now() + 250
+          ignoreProgrammaticScrollTopRef.current = snapshot.scrollTop
+          setScrollTopWithoutLayoutRead(container, snapshot.scrollTop)
+        }
         setVirtualViewport((current) => ({
           scrollTop: snapshot.scrollTop,
           viewportHeight: container.clientHeight || current.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT,
@@ -3103,7 +3189,7 @@ export function MessageList({
     () => renderItems.map((item, index) => {
       const key = renderItemKeys[index]!
       const signature = getRenderItemMetricSignature(item)
-      const cached = virtualItemMetricCacheRef.current.get(key)
+      const cached = virtualItemMetricCache.get(key)
       if (cached?.signature === signature) return cached
 
       const metric = {
@@ -3111,10 +3197,10 @@ export function MessageList({
         contentWeight: getRenderItemContentWeight(item),
         estimatedHeight: estimateRenderItemHeight(item),
       }
-      virtualItemMetricCacheRef.current.set(key, metric)
+      virtualItemMetricCache.set(key, metric)
       return metric
     }),
-    [renderItemKeys, renderItems],
+    [renderItemKeys, renderItems, virtualItemMetricCache],
   )
   // Compare against the last committed list, so an interrupted render cannot
   // become the source of measured geometry for a later history reload.
@@ -3127,13 +3213,13 @@ export function MessageList({
     const previous = previousRenderItemsRef.current
     if (previous.sessionId !== resolvedSessionId || haveSameRenderItemKeys(previous.keys, renderItemKeys)) return
     carryMeasuredHeightsToRenamedItems(
-      virtualItemHeightsRef.current,
+      virtualItemHeights,
       previous.keys,
       previous.items.map(getRenderItemReloadSignature),
       renderItemKeys,
       renderItems.map(getRenderItemReloadSignature),
     )
-  }, [renderItemKeys, renderItems, resolvedSessionId])
+  }, [renderItemKeys, renderItems, resolvedSessionId, virtualItemHeights])
   useLayoutEffect(() => {
     previousRenderItemsRef.current = { sessionId: resolvedSessionId, keys: renderItemKeys, items: renderItems }
   }, [renderItemKeys, renderItems, resolvedSessionId])
@@ -3165,17 +3251,47 @@ export function MessageList({
 
     return buildConversationNavigationItems(sources)
   }, [renderItems])
+  const scrollAnchor = lastSessionIdRef.current !== resolvedSessionId
+    ? (resolvedSessionId ? sessionScrollSnapshots.get(resolvedSessionId)?.anchor : null)
+    : restoringScrollAnchorRef.current
   const virtualTranscriptWindow = useMemo(
     () => buildVirtualTranscriptWindow(
       renderItems,
       renderItemKeys,
       renderItemMetrics,
-      virtualItemHeightsRef.current,
+      virtualItemHeights,
       virtualViewport,
       VIRTUAL_OVERSCAN_PX,
+      scrollAnchor,
     ),
-    [measuredItemsVersion, renderItemKeys, renderItemMetrics, renderItems, virtualViewport],
+    [measuredItemsVersion, renderItemKeys, renderItemMetrics, renderItems, scrollAnchor, virtualItemHeights, virtualViewport],
   )
+
+  useLayoutEffect(() => {
+    const anchor = restoringScrollAnchorRef.current
+    const container = scrollContainerRef.current
+    if (!container || !resolvedSessionId || container.clientHeight <= 0) return
+    if (!anchor) {
+      // A large scrollbar jump mounts a different window after its scroll event.
+      // Capture that committed DOM, not the old rows still mounted in onScroll.
+      if (!shouldAutoScrollRef.current) rememberSessionScroll(resolvedSessionId, container, false)
+      return
+    }
+    const row = [...container.querySelectorAll<HTMLElement>('[data-chat-render-item-key]')]
+      .find((node) => node.dataset.chatRenderItemKey === anchor.itemKey)
+    if (!row || row.getBoundingClientRect().height <= 0) return
+    const correction = row.getBoundingClientRect().top - container.getBoundingClientRect().top - anchor.offset
+    if (Math.abs(correction) >= 1) {
+      setScrollTopWithoutLayoutRead(container, container.scrollTop + correction)
+    }
+    ignoreProgrammaticScrollTopRef.current = container.scrollTop
+    // Do not enqueue a layout update on an already aligned render. The render
+    // model can refresh without a geometry change (e.g. checkpoint hydration).
+    if (Math.abs(virtualViewport.scrollTop - container.scrollTop) >= 1 || virtualViewport.viewportHeight !== container.clientHeight) {
+      syncVirtualViewportFromContainer(container)
+    }
+    sessionScrollSnapshots.set(resolvedSessionId, { scrollTop: container.scrollTop, wasAtBottom: false, anchor })
+  }, [measuredItemsVersion, resolvedSessionId, syncVirtualViewportFromContainer, virtualTranscriptWindow, virtualViewport])
 
   useLayoutEffect(() => {
     if (previousAppearanceSignature.current === appearanceSignature) return
@@ -3191,12 +3307,12 @@ export function MessageList({
     const oldScrollTop = virtualViewport.scrollTop
     let anchorIndex = 0
     while (anchorIndex + 1 < renderItemKeys.length && oldOffsets[anchorIndex + 1]! <= oldScrollTop) anchorIndex += 1
-    virtualItemHeightsRef.current.clear()
+    virtualItemHeights.clear()
     for (const node of container.querySelectorAll<HTMLElement>('[data-virtual-message-item]')) {
       const height = node.getBoundingClientRect().height
-      if (height > 0) virtualItemHeightsRef.current.set(node.dataset.virtualMessageItem!, clampNumber(height, VIRTUAL_MIN_ITEM_HEIGHT, VIRTUAL_MAX_ITEM_HEIGHT))
+      if (height > 0) virtualItemHeights.set(node.dataset.virtualMessageItem!, clampNumber(height, VIRTUAL_MIN_ITEM_HEIGHT, VIRTUAL_MAX_ITEM_HEIGHT))
     }
-    const offsets = buildVirtualItemOffsets(renderItemKeys, renderItemMetrics, virtualItemHeightsRef.current)
+    const offsets = buildVirtualItemOffsets(renderItemKeys, renderItemMetrics, virtualItemHeights)
     const intraRowOffset = Math.max(0, oldScrollTop - (oldOffsets[anchorIndex] ?? 0))
     const rowHeight = (offsets[anchorIndex + 1] ?? 0) - (offsets[anchorIndex] ?? 0)
     const nextScrollTop = shouldAutoScrollRef.current
@@ -3207,7 +3323,7 @@ export function MessageList({
     pendingAppearanceScrollTop.current = nextScrollTop
     setVirtualViewport((current) => ({ ...current, scrollTop: nextScrollTop }))
     setMeasuredItemsVersion((version) => version + 1)
-  }, [appearanceSignature, renderItemKeys, renderItemMetrics, resolvedSessionId, virtualTranscriptWindow, virtualViewport.scrollTop])
+  }, [appearanceSignature, renderItemKeys, renderItemMetrics, resolvedSessionId, virtualItemHeights, virtualTranscriptWindow, virtualViewport.scrollTop])
 
   useLayoutEffect(() => {
     const target = pendingAppearanceScrollTop.current
@@ -3295,19 +3411,19 @@ export function MessageList({
   useEffect(() => {
     const liveKeys = new Set(renderItemKeys)
     let removed = false
-    for (const key of virtualItemHeightsRef.current.keys()) {
+    for (const key of virtualItemHeights.keys()) {
       if (!liveKeys.has(key)) {
-        virtualItemHeightsRef.current.delete(key)
+        virtualItemHeights.delete(key)
         removed = true
       }
     }
-    for (const key of virtualItemMetricCacheRef.current.keys()) {
+    for (const key of virtualItemMetricCache.keys()) {
       if (!liveKeys.has(key)) {
-        virtualItemMetricCacheRef.current.delete(key)
+        virtualItemMetricCache.delete(key)
       }
     }
     if (removed) setMeasuredItemsVersion((version) => version + 1)
-  }, [renderItemKeys])
+  }, [renderItemKeys, virtualItemHeights, virtualItemMetricCache])
 
   useEffect(() => {
     if (!resolvedSessionId || !checkpointHistoryReady || completedTurnTargets.length === 0 || isDirectAgentSession) {
@@ -3519,13 +3635,17 @@ export function MessageList({
     () => new Set(completedTurnTargets.map((target) => target.messageId)),
     [completedTurnTargets],
   )
+  const unansweredTurnTargets = useMemo(
+    () => getUnansweredTurnTargets(deferredMessages),
+    [deferredMessages],
+  )
   const checkpointPreviewOverBudget = workspaceChangesFallback !== null &&
     workspaceChangesFallback.sessionId === resolvedSessionId
   // Past the preview budget the server lists no checkpoints at all, but one
   // rewind still resolves a prompt by its transcript id, so those prompts stay
   // editable. This mode tells the user file undo is unavailable, so the edit
   // rolls back the conversation only.
-  const editTurnCards = useMemo<EditableTurnCard[]>(
+  const completedEditCards = useMemo<EditableTurnCard[]>(
     () => checkpointPreviewOverBudget
       ? completedTurnTargets.flatMap((target) => target.transcriptMessageId
         ? [{
@@ -3538,6 +3658,31 @@ export function MessageList({
         : [])
       : visibleTurnChangeCards,
     [checkpointPreviewOverBudget, completedTurnTargets, visibleTurnChangeCards],
+  )
+  // A prompt stopped before any reply has no checkpoint but nothing to restore
+  // either, so it rewinds the conversation only. One the CLI never
+  // acknowledged is not in the transcript at all: it is dropped locally.
+  // The prompt still being answered is not a stopped one.
+  const unansweredEditCards = useMemo<EditableTurnCard[]>(
+    () => unansweredTurnTargets.flatMap<EditableTurnCard>(({ target, latest }) => {
+      if (latest && turnInProgress) return []
+      const cardTarget = { messageId: target.messageId, expectedContent: target.expectedContent }
+      if (target.transcriptMessageId) {
+        return [{
+          target: cardTarget,
+          checkpoint: {
+            target: { targetUserMessageId: target.transcriptMessageId, userMessageIndex: target.userMessageIndex },
+          },
+          conversationOnly: true,
+        }]
+      }
+      return latest && target.awaitingReplay ? [{ target: cardTarget, unconfirmed: true as const }] : []
+    }),
+    [turnInProgress, unansweredTurnTargets],
+  )
+  const editTurnCards = useMemo(
+    () => unansweredEditCards.length === 0 ? completedEditCards : [...completedEditCards, ...unansweredEditCards],
+    [completedEditCards, unansweredEditCards],
   )
   const editBlockedReason = turnInProgress
     ? t('chat.editMessageWaitForTurn')
@@ -3580,6 +3725,7 @@ export function MessageList({
     if (!container) return
 
     const viewportHeight = container.clientHeight || virtualViewport.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT
+    restoringScrollAnchorRef.current = null
     userScrollIntentUntilRef.current = 0
     setProgrammaticNavigationItemId(item.id)
     setHighlightedNavigationItemKey(item.renderItemKey)
@@ -3669,6 +3815,7 @@ export function MessageList({
       Math.max(0, virtualTranscriptWindow.totalHeight - viewportHeight),
     )
 
+    restoringScrollAnchorRef.current = null
     setActiveConversationFindMatch(match)
     shouldAutoScrollRef.current = false
     setIsAwayFromLatest(true)
@@ -3785,6 +3932,7 @@ export function MessageList({
     const container = scrollContainerRef.current
     const content = scrollContentRef.current
     if (!container || !content || !resolvedSessionId) return
+    restoringScrollAnchorRef.current = null
 
     const renderItem = [...content.querySelectorAll<HTMLElement>('[data-chat-render-item-key]')]
       .find((node) => node.dataset.chatRenderItemKey === origin.sourceTurnKey)
@@ -3906,12 +4054,18 @@ export function MessageList({
                 window.endedAt !== undefined &&
                 item.startedAt <= window.endedAt
               )) ? 'completed' : 'forming'
+              // An ended team's tasks say how it ended. Without its record, a
+              // team its lead deleted is taken as done, and one the host
+              // removed (a cancelled or ended plan) only as ended.
+              const ended = cardSnapshot ? endedPhase(cardSnapshot) : item.deletedByLead ? 'completed' : 'ended'
               return (
               <AgentTeamsInlineCard
                 snapshot={cardSnapshot}
                 teamName={item.teamName}
                 fallbackPhase={fallbackPhase}
-                phaseOverride={item.endedAt !== undefined ? 'completed' : undefined}
+                phaseOverride={item.endedAt !== undefined
+                  ? ended
+                  : cardSnapshot && !cardSnapshot.deletedAt && cardSnapshot.team.name === interruptedTeamName ? 'interrupted' : undefined}
                 onOpen={cardSnapshot
                   ? () => openTeamWorkbench(resolvedSessionId, cardSnapshot.team.name)
                   : undefined}
@@ -4000,6 +4154,12 @@ export function MessageList({
   }
 
   return (
+    <ScrollSnapshotBoundary sessionId={resolvedSessionId} onLeave={() => {
+      const container = scrollContainerRef.current
+      if (resolvedSessionId && container && container.clientHeight > 0) {
+        rememberSessionScroll(resolvedSessionId, container, shouldAutoScrollRef.current)
+      }
+    }}>
     <ConversationImageGalleryContext.Provider
       value={getConversationImages}
     >
@@ -4014,6 +4174,7 @@ export function MessageList({
         onWheel={handleWheelScrollIntent}
         onPointerDown={markUserScrollIntent}
         onTouchStart={markUserScrollIntent}
+        onFocusCapture={markUserScrollIntent}
         onKeyDown={handleKeyDownScrollIntent}
         className={`${CHAT_SCROLL_AREA_CLASS} h-full overflow-y-auto ${chatScrollPaddingClass}`}
       >
@@ -4052,6 +4213,9 @@ export function MessageList({
             const mountKey = groupMountKeys.keys.get(itemKey) ?? itemKey
             const content = renderTranscriptItem(item, index)
             const railPosition = turnRailPositions[index] ?? 'none'
+            // The prompt editor opens its slash and @ menus upward, past the
+            // row's own box; paint containment would cut them off.
+            const paintContained = !(item.kind === 'message' && editActionByMessageId.get(item.message.id)?.editing)
 
             return virtualTranscriptWindow.enabled ? (
               <MeasuredRenderItem
@@ -4068,7 +4232,7 @@ export function MessageList({
                 key={mountKey}
                 data-chat-render-item-key={itemKey}
                 data-turn-rail={railPosition}
-                className={`${CHAT_RENDER_ITEM_CLASS} chat-render-item--cv ${turnRailClass(railPosition)} ${highlightedNavigationItemKey === itemKey ? 'chat-render-item--navigation-target' : ''}`}
+                className={`${CHAT_RENDER_ITEM_CLASS} ${paintContained ? 'chat-render-item--cv ' : ''}${turnRailClass(railPosition)} ${highlightedNavigationItemKey === itemKey ? 'chat-render-item--navigation-target' : ''}`}
               >
                 {content}
               </div>
@@ -4178,6 +4342,7 @@ export function MessageList({
       />
     </div>
     </ConversationImageGalleryContext.Provider>
+    </ScrollSnapshotBoundary>
   )
 }
 

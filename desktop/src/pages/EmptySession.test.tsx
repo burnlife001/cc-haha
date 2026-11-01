@@ -1038,7 +1038,7 @@ describe('EmptySession', () => {
     try {
       expect(useSessionRuntimeStore.getState().selections['draft-session']).toEqual({
         providerId: 'deepseek-account',
-        modelId: 'deepseek-v4-pro[1m]',
+        modelId: 'deepseek-flash[1m]',
         effortLevel: 'high',
       })
     } finally {
@@ -1809,7 +1809,8 @@ describe('EmptySession', () => {
     expect(screen.getByTestId('agent-profile-detail')).toHaveTextContent('Choose before the first message')
     fireEvent.click(within(row).getByRole('radio', { name: 'Lean' }))
     // Lean's limits are read next to the choice, and the toolbar says "Lean".
-    expect(screen.getByTestId('agent-profile-detail')).toHaveTextContent('Web search and fetch, connectors (MCP)')
+    expect(screen.getByTestId('agent-profile-detail')).toHaveTextContent('web fetch, sub-agents, task lists')
+    expect(screen.getByTestId('agent-profile-detail')).toHaveTextContent('Unavailable Connectors (MCP), Agent Teams')
     expect(screen.getByTestId('agent-profile-chip')).toHaveTextContent(/^Lean$/)
   })
 

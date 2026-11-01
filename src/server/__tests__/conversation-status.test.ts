@@ -238,9 +238,10 @@ describe('live session activity for the phone session list', () => {
     mock.restore()
   })
 
-  async function getLiveStatus(): Promise<Array<{ id: string; activityState: string }>> {
+  async function getLiveStatus(includeTeamWorkers = false): Promise<Array<{ id: string; activityState: string }>> {
     const { handleSessionsApi } = await import('../api/sessions.js')
     const url = new URL('http://127.0.0.1/api/sessions/live-status')
+    if (includeTeamWorkers) url.searchParams.set('includeTeamWorkers', '1')
     const response = await handleSessionsApi(new Request(url), url, ['api', 'sessions', 'live-status'])
     expect(response.status).toBe(200)
     const body = (await response.json()) as { sessions: Array<{ id: string; activityState: string }> }
@@ -288,6 +289,18 @@ describe('live session activity for the phone session list', () => {
     expect(live.some((entry) => entry.id === worker)).toBe(false)
   })
 
+  it('includes independently tracked worker turns only for the prevent-sleep query', async () => {
+    const lead = 'power-idle-lead'
+    const worker = 'power-running-worker'
+    __markActiveTurnForTests(worker)
+    spyOn(conversationService, 'getActiveSessions').mockReturnValue([lead, worker])
+    spyOn(conversationService, 'isTeamWorkerSession').mockImplementation((id: string) => id === worker)
+    expect(await getLiveStatus()).toEqual([])
+    expect(await getLiveStatus(true)).toEqual([{ id: worker, activityState: 'running' }])
+    __settleActiveTurnForTests(worker, { type: 'result' })
+    expect(await getLiveStatus(true)).toEqual([])
+  })
+
   it('mobile dashboard includes failed sessions and safe permission summaries without tool input', async () => {
     const { handleSessionsApi } = await import('../api/sessions.js')
     const failed = 'mobile-status-failed'
@@ -304,6 +317,13 @@ describe('live session activity for the phone session list', () => {
     expect(body.sessions).toContainEqual(expect.objectContaining({ id: waiting, activityState: 'waiting', toolName: 'AskUserQuestion', requestId: 'q1', preview: '等待你回答问题', autoAnswerDeadline: 12345 }))
     expect(JSON.stringify(body)).not.toContain('NEVER_PROJECT')
     expect((await handleSessionsApi(new Request(url, { method: 'POST' }), url, ['api', 'sessions', 'mobile-status'])).status).toBe(405)
+  })
+
+  it('mobile dashboard does not call a finished turn stalled while a background task keeps it running', async () => {
+    const { listMobileSessionActivity } = await import('../ws/handler.js')
+    __markActiveTurnForTests('finished-turn')
+    spyOn(mobileActivityClock, 'read').mockReturnValue({ startedAt: 1000, lastProgressAt: 2000, completedAt: 2000 })
+    expect(listMobileSessionActivity()).toContainEqual(expect.objectContaining({ id: 'finished-turn', activityState: 'running', stalled: false }))
   })
 
   it('mobile dashboard projects bounded question and command previews with actual run timing', async () => {

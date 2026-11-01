@@ -1012,6 +1012,11 @@ class TraceCaptureService {
     const pendingWrite = traceWriteQueues.get(filePath)
     if (pendingWrite) await pendingWrite.catch(() => {})
 
+    // Never delete a same-named file that is not a trace (the directory can be shared).
+    if (await fs.stat(filePath).then(() => true, () => false) && !await isTraceFile(filePath)) {
+      return { sessionId: normalizedSessionId, deleted: false }
+    }
+
     try {
       await fs.unlink(filePath)
       traceReadCache.delete(filePath)
@@ -2946,6 +2951,30 @@ type TraceFileSnapshot = {
   stat: Stats
 }
 
+// Every line this module writes is `{"type":"call"|"event",...}`.
+const TRACE_LINE_PREFIX = /^\{"type":"(?:call|event)"/
+
+/**
+ * Whether a `.jsonl` file is positively something other than a trace. Only a file whose head was
+ * read and does not look like a trace line is excluded; one that is empty or cannot be read (for
+ * example removed between listing and opening) stays a trace candidate so the normal read path
+ * decides what to do with it.
+ */
+async function isTraceFile(path: string): Promise<boolean> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined
+  try {
+    handle = await fs.open(path, 'r')
+    const head = Buffer.alloc(16)
+    const { bytesRead } = await handle.read(head, 0, head.length, 0)
+    if (bytesRead === 0) return true
+    return TRACE_LINE_PREFIX.test(head.toString('utf8', 0, bytesRead))
+  } catch {
+    return true
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+}
+
 async function listTraceFiles(storageDir: string): Promise<TraceFileSnapshot[]> {
   let entries: string[] = []
   try {
@@ -2960,6 +2989,8 @@ async function listTraceFiles(storageDir: string): Promise<TraceFileSnapshot[]> 
     .map(async (name) => {
       const stat = await fs.stat(join(storageDir, name)).catch(() => null)
       if (!stat?.isFile()) return null
+      // A custom directory may be shared with other JSONL files (history.jsonl, ...).
+      if (!await isTraceFile(join(storageDir, name))) return null
       return {
         name,
         path: join(storageDir, name),

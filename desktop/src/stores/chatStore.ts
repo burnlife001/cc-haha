@@ -486,6 +486,12 @@ type ChatStore = {
     /** Retain an edit after its committed rewind outlives the source tab. */
     options?: { restoreMissingSession?: boolean },
   ) => void
+  /**
+   * Drop the last prompt when the CLI never acknowledged it and nothing has
+   * answered it, so an edited copy can replace it. False — and nothing removed
+   * — once the prompt has been confirmed, answered or followed by another turn.
+   */
+  discardUnconfirmedUserMessage: (sessionId: string, messageId: string) => boolean
   clearComposerPrefill: (sessionId: string, nonce?: number) => void
   queueComposerInsertion: (
     sessionId: string,
@@ -2411,22 +2417,30 @@ function summarizeTokenUsageFromHistory(messages: MessageEntry[]): TokenUsage | 
   let cacheReadTokens = 0
   let cacheCreationTokens = 0
   // A reply with thinking + text + a dozen tool_use blocks arrives as fourteen lines that each
-  // repeat the whole `usage` object. Summing per line is the 2.2x inflation the transcript
-  // readers carry; the server stamps `usageKey` so this only has to dedupe on it. Lines with
-  // no key are always counted, matching the transcript readers.
-  const countedUsageKeys = new Set<string>()
+  // carry a `usage` object, and the lines need not agree: the first can be zero/partial with the
+  // final numbers on a later line. Summing per line is the 2.2x inflation, keeping the first
+  // under-counts. The server stamps `usageKey`; per key each field counts at the largest value any
+  // line reported and only the excess is added. Lines with no key are always counted whole.
+  const counted = new Map<string, [number, number, number, number]>()
 
   for (const message of messages) {
     const usage = message.usage
     if (!usage) continue
-    if (message.usageKey) {
-      if (countedUsageKeys.has(message.usageKey)) continue
-      countedUsageKeys.add(message.usageKey)
-    }
-    inputTokens += readUsageToken(usage.input_tokens)
-    outputTokens += readUsageToken(usage.output_tokens)
-    cacheReadTokens += readUsageToken(usage.cache_read_input_tokens)
-    cacheCreationTokens += readUsageToken(usage.cache_creation_input_tokens)
+    const current: [number, number, number, number] = [
+      readUsageToken(usage.input_tokens),
+      readUsageToken(usage.output_tokens),
+      readUsageToken(usage.cache_read_input_tokens),
+      readUsageToken(usage.cache_creation_input_tokens),
+    ]
+    const previous = message.usageKey ? counted.get(message.usageKey) : undefined
+    const total = previous
+      ? (current.map((value, index) => Math.max(value, previous[index]!)) as [number, number, number, number])
+      : current
+    if (message.usageKey) counted.set(message.usageKey, total)
+    inputTokens += total[0] - (previous?.[0] ?? 0)
+    outputTokens += total[1] - (previous?.[1] ?? 0)
+    cacheReadTokens += total[2] - (previous?.[2] ?? 0)
+    cacheCreationTokens += total[3] - (previous?.[3] ?? 0)
   }
 
   if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && cacheCreationTokens === 0) {
@@ -4565,6 +4579,28 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         },
       }
     })
+  },
+
+  discardUnconfirmedUserMessage: (sessionId, messageId) => {
+    const session = get().sessions[sessionId]
+    if (!session || session.chatState !== 'idle') return false
+    const index = session.messages.findIndex((message) => message.id === messageId)
+    const message = session.messages[index]
+    if (message?.type !== 'user_text' || !message.awaitingReplay || message.transcriptMessageId) return false
+    const answered = session.messages.slice(index + 1).some((later) =>
+      later.type === 'user_text' ||
+      later.type === 'assistant_text' ||
+      later.type === 'tool_use' ||
+      later.type === 'tool_result' ||
+      later.type === 'error')
+    if (answered) return false
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, (current) => ({
+        messages: current.messages.slice(0, index),
+        historyMutationEpoch: (current.historyMutationEpoch ?? 0) + 1,
+      })),
+    }))
+    return true
   },
 
   clearComposerPrefill: (sessionId, nonce) => {

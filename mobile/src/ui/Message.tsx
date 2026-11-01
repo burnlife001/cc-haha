@@ -1,11 +1,14 @@
-import { parseUserMessageSegments } from '../../../src/shared/userMessageCapabilities'
-import { memo, useRef, type ComponentRef } from 'react'
-import { Image, Platform, Pressable, ScrollView, View, type TextStyle } from 'react-native'
+import { memo, useMemo, useRef, useState, type ComponentRef } from 'react'
+import { Image, Keyboard, Platform, Pressable, ScrollView, View, type TextStyle } from 'react-native'
 import { Text } from './Text'
 import type { ChatItem } from '../core/types'
 import { visibleMessageText } from '../core/chatComposer'
+import { userMessageDisplay, type UserMessageCapability } from '../core/userMessageDisplay'
 import { Callout, CodeBlock, Icon, InlineCode, useColors } from './kit'
-import { parseInline, parseMarkdown } from './chat/markdown'
+import { fitColumnWidths, naturalColumnWidths, parseInline, parseMarkdown } from './chat/markdown'
+import { ImagePreview } from './chat/ImagePreview'
+import { attachmentImageSelection, attachmentImageUri, type ImagePreviewSelection } from './chat/attachmentPreview'
+import { Glyph } from './compose/glyphs'
 
 function Inline({
   text,
@@ -33,7 +36,11 @@ function Inline({
   )
 }
 
-/** 表格：列宽按内容估算，整张表可以横向滑动，手机上不挤成一团。 */
+/**
+ * 表格：按容器的可用宽度分配列宽，整张表铺满一屏；列太多、压到可读下限还放不下时，
+ * 才退回横向滑动。之前列宽只按内容估算，窄屏上表头底色和最后一列会在右侧留一截空白，
+ * 看起来像被截断。
+ */
 function MarkdownTable({
   header,
   rows,
@@ -44,10 +51,15 @@ function MarkdownTable({
   selectable: boolean
 }) {
   const colors = useColors()
-  const widths = header.map((title, column) => {
-    const longest = Math.max(title.length, ...rows.map((row) => (row[column] ?? '').length))
-    return Math.min(240, Math.max(72, longest * 9 + 24))
-  })
+  const [available, setAvailable] = useState(0)
+  const natural = useMemo(() => naturalColumnWidths(header, rows), [header, rows])
+  // ScrollView 的 1px 边框算在布局宽度里，内容只分到去掉边框后的宽度。
+  const measured = available > 2
+  const fitted = measured ? fitColumnWidths(natural, available - 2) : null
+  const widths = fitted ?? natural
+  // 宽度还没量到（0）时先按自然列宽渲染；量到 1–2px 这种退化宽度时仍允许横滑，
+  // 否则内容会超宽又动不了。
+  const scroll = measured ? fitted === null : available > 0
   const cell = (text: string, column: number, head: boolean, last: boolean) => (
     <View
       key={column}
@@ -67,22 +79,31 @@ function MarkdownTable({
     </View>
   )
   return (
-    <ScrollView
-      horizontal
-      showsHorizontalScrollIndicator={false}
-      style={{ borderRadius: 12, borderWidth: 1, borderColor: colors.hair, backgroundColor: colors.card }}
+    <View
+      style={{ width: '100%' }}
+      onLayout={(event) => {
+        const next = Math.round(event.nativeEvent.layout.width)
+        setAvailable((previous) => (previous === next ? previous : next))
+      }}
     >
-      <View>
-        <View style={{ flexDirection: 'row', backgroundColor: colors.fill }}>
-          {header.map((title, column) => cell(title, column, true, column === header.length - 1))}
-        </View>
-        {rows.map((row, rowIndex) => (
-          <View key={rowIndex} style={{ flexDirection: 'row', borderTopWidth: 1, borderTopColor: colors.hair }}>
-            {row.map((text, column) => cell(text, column, false, column === row.length - 1))}
+      <ScrollView
+        horizontal
+        scrollEnabled={scroll}
+        showsHorizontalScrollIndicator={scroll}
+        style={{ borderRadius: 12, borderWidth: 1, borderColor: colors.hair, backgroundColor: colors.card }}
+      >
+        <View>
+          <View style={{ flexDirection: 'row', backgroundColor: colors.fill }}>
+            {header.map((title, column) => cell(title, column, true, column === header.length - 1))}
           </View>
-        ))}
-      </View>
-    </ScrollView>
+          {rows.map((row, rowIndex) => (
+            <View key={rowIndex} style={{ flexDirection: 'row', borderTopWidth: 1, borderTopColor: colors.hair }}>
+              {row.map((text, column) => cell(text, column, false, column === row.length - 1))}
+            </View>
+          ))}
+        </View>
+      </ScrollView>
+    </View>
   )
 }
 
@@ -159,20 +180,28 @@ const inlineSelectable = Platform.OS === 'web'
 
 function Attachments({ item }: { item: ChatItem }) {
   const colors = useColors()
+  const [preview, setPreview] = useState<ImagePreviewSelection | null>(null)
   if (!item.attachments?.length) return null
   return (
     <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-      {item.attachments.map((attachment, index) =>
-        attachment.type === 'image' && attachment.data ? (
-          <Image
+      {item.attachments.map((attachment, index) => {
+        const uri = attachmentImageUri(attachment)
+        return uri ? (
+          <Pressable
             key={index}
-            accessibilityLabel={attachment.name || '图片'}
-            source={{
-              uri: `data:${attachment.mimeType ?? 'image/jpeg'};base64,${attachment.data.replace(/^data:[^,]*,/, '')}`,
+            accessibilityRole="button"
+            accessibilityLabel={`预览 ${attachment.name || '图片'}`}
+            onPress={() => {
+              Keyboard.dismiss()
+              setPreview(attachmentImageSelection(item.attachments!, index))
             }}
-            resizeMode="cover"
-            style={{ width: 120, height: 120, borderRadius: 12, backgroundColor: colors.fill }}
-          />
+          >
+            <Image
+              source={{ uri }}
+              resizeMode="cover"
+              style={{ width: 120, height: 120, borderRadius: 12, backgroundColor: colors.fill }}
+            />
+          </Pressable>
         ) : (
           <View
             key={index}
@@ -194,7 +223,8 @@ function Attachments({ item }: { item: ChatItem }) {
             </Text>
           </View>
         )
-      )}
+      })}
+      {preview ? <ImagePreview {...preview} onClose={() => setPreview(null)} /> : null}
     </View>
   )
 }
@@ -218,7 +248,7 @@ export const Message = memo(function Message({
       </Text>
     )
   const text = visibleMessageText(item.text)
-  const team = item.text.includes('<agent-team-request>')
+  const team = text !== item.text
   const longPress = () => {
     const node = bubble.current
     if (!node || !onLongPress) return
@@ -278,6 +308,7 @@ export function UserBubble({
   selectable?: boolean
 }) {
   const colors = useColors()
+  const display = userMessageDisplay(text, team)
   return (
     <View
       style={{
@@ -291,25 +322,46 @@ export function UserBubble({
         gap: 8,
       }}
     >
-      {text ? (
+      {display.capabilities.length ? (
+        <View
+          testID="user-message-capabilities"
+          style={{ alignSelf: 'flex-start', flexDirection: 'row', flexWrap: 'wrap', gap: 6, maxWidth: '100%' }}
+        >
+          {display.capabilities.map((capability) => (
+            <MessageCapability key={`${capability.kind}:${capability.id}`} capability={capability} />
+          ))}
+        </View>
+      ) : null}
+      {display.text ? (
         <Text
           selectable={selectable}
           style={{ fontSize: 16, lineHeight: 23, color: colors.ink }}
         >
-          {parseUserMessageSegments(text).map((segment, index) => segment.type === 'text' ? segment.text : (
-            <Text key={index} style={{ fontWeight: '600', backgroundColor: colors.fill, color: colors.ink2 }}>
-              {segment.type === 'command' ? segment.name : `@${segment.label}`}
-            </Text>
-          ))}
+          {display.text}
         </Text>
       ) : null}
       <Attachments item={item} />
-      {team ? (
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
-          <Icon name="users" size={13} color={colors.run} strokeWidth={2} />
-          <Text style={{ fontSize: 12.5, fontWeight: '600', color: colors.run }}>Agent 团队</Text>
-        </View>
-      ) : null}
+    </View>
+  )
+}
+
+function MessageCapability({ capability }: { capability: UserMessageCapability }) {
+  const colors = useColors()
+  return (
+    <View
+      testID="user-message-capability"
+      accessible
+      accessibilityLabel={capability.label}
+      style={{ maxWidth: '100%', flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 10, backgroundColor: colors.runTint }}
+    >
+      {capability.kind === 'computer' || capability.kind === 'plugin' ? (
+        <Glyph name={capability.kind === 'computer' ? 'monitor' : 'plug'} size={13} color={colors.run} />
+      ) : (
+        <Icon name={capability.kind === 'team' ? 'users' : capability.kind === 'command' ? 'terminal' : 'sparkle'} size={13} color={colors.run} />
+      )}
+      <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: 12.5, lineHeight: 17, fontWeight: '600', color: colors.run }}>
+        {capability.label}
+      </Text>
     </View>
   )
 }

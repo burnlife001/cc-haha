@@ -21,6 +21,7 @@ import {
 } from '../services/traceCaptureService.js'
 import type { CreateProviderInput } from '../types/provider.js'
 import { buildComputerUseTools } from '../../vendor/computer-use-mcp/tools.js'
+import { GROK_MODEL_CATALOG, setGrokRuntimeModelCatalog } from '../../services/grokAuth/models.js'
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -829,6 +830,32 @@ describe('ProviderService', () => {
     })
 
     describe('Grok Official provider metadata', () => {
+      test('keeps discovered capabilities in launch env and removes stale snapshots from settings', async () => {
+        const catalog = [{
+          value: 'grok-future-release', label: 'Future', description: '',
+          supportsReasoningEffort: true, reasoningEffort: 'low', reasoningEfforts: ['low', 'xhigh', 'max'],
+        }]
+        setGrokRuntimeModelCatalog(catalog)
+        try {
+          const svc = new ProviderService()
+          await svc.updateManagedSettings({ env: {
+            CC_HAHA_GROK_MODEL_CATALOG: 'stale-catalog', USER_CUSTOM_ENV: 'preserved',
+          } })
+          await svc.activateProvider('grok-official')
+          const persistedEnv = (await readSettings()).env as Record<string, string>
+          expect(persistedEnv.CC_HAHA_GROK_MODEL_CATALOG).toBeUndefined()
+          expect(persistedEnv.USER_CUSTOM_ENV).toBe('preserved')
+          const runtimeEnv = await svc.getProviderRuntimeEnv('grok-official')
+          expect(JSON.parse(runtimeEnv.CC_HAHA_GROK_MODEL_CATALOG!)).toEqual(catalog)
+
+          await svc.updateManagedSettings({ env: { ...persistedEnv, CC_HAHA_GROK_MODEL_CATALOG: 'stale-catalog' } })
+          await svc.activateOfficial()
+          expect(((await readSettings()).env as Record<string, string>).CC_HAHA_GROK_MODEL_CATALOG).toBeUndefined()
+        } finally {
+          setGrokRuntimeModelCatalog(GROK_MODEL_CATALOG)
+        }
+      })
+
       test('normalizes the built-in Grok provider and appends it to legacy provider order', async () => {
         await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
         await fs.writeFile(
@@ -941,10 +968,13 @@ describe('ProviderService', () => {
           baseUrl: 'https://api.deepseek.com/anthropic',
           runtimeKind: 'deepseek_oauth',
         })
-        expect(provider.models.main).toBe('deepseek-v4-pro[1m]')
-        // The account listing names V4.1 Flash `deepseek-flash`; it does not
-        // list the API-key route's `deepseek-v4-flash`.
-        expect(provider.models.haiku).toBe('deepseek-flash')
+        expect(provider.models).toEqual({
+          main: 'deepseek-flash[1m]',
+          fable: 'deepseek-flash[1m]',
+          haiku: 'deepseek-flash[1m]',
+          sonnet: 'deepseek-flash[1m]',
+          opus: 'deepseek-flash[1m]',
+        })
         expect(provider.modelContextWindows?.['deepseek-flash']).toBe(1_000_000)
       })
 
@@ -989,7 +1019,13 @@ describe('ProviderService', () => {
           path.join(tmpDir, 'cc-haha', 'deepseek-oauth.json'),
         )
         expect(env.ANTHROPIC_BASE_URL).toBe('https://api.deepseek.com/anthropic')
-        expect(env.ANTHROPIC_MODEL).toBe('deepseek-v4-pro[1m]')
+        for (const key of [
+          'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_FABLE_MODEL',
+          'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+          'ANTHROPIC_DEFAULT_OPUS_MODEL',
+        ]) {
+          expect(env[key]).toBe('deepseek-flash[1m]')
+        }
         expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
         expect(env.ANTHROPIC_API_KEY).toBe('deepseek-oauth-dummy-key')
         // The previously active OAuth provider's markers are cleared.
@@ -3871,8 +3907,11 @@ describe('Providers API', () => {
       }
     }
     expect((await list()).deepSeekAccountModels).toMatchObject({
-      main: 'deepseek-v4-pro[1m]',
-      haiku: 'deepseek-flash',
+      main: 'deepseek-flash[1m]',
+      fable: 'deepseek-flash[1m]',
+      haiku: 'deepseek-flash[1m]',
+      sonnet: 'deepseek-flash[1m]',
+      opus: 'deepseek-flash[1m]',
     })
 
     const saved = {
@@ -4774,11 +4813,11 @@ describe('OpenCode Go preset request contract', () => {
         message: 'Upstream returned no body for stream',
       },
       {
-        name: 'safety stop with no output',
+        name: 'malformed function call with no output',
         stream: false,
-        upstream: [() => Response.json({ candidates: [{ finishReason: 'SAFETY' }] })],
+        upstream: [() => Response.json({ candidates: [{ finishReason: 'MALFORMED_FUNCTION_CALL' }] })],
         status: 502,
-        message: 'Gemini stopped with SAFETY',
+        message: 'Gemini stopped with MALFORMED_FUNCTION_CALL',
       },
       {
         name: 'refused continuation',
@@ -4805,6 +4844,31 @@ describe('OpenCode Go preset request contract', () => {
         expect(reported, name).toContain(message)
         expect(text, name).not.toContain('message_stop')
         expect(call, name).toBe(upstream.length)
+      }
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('reports a Gemini policy block as a refusal rather than an error the CLI would retry', async () => {
+    const { provider } = await createProvider()
+    const originalFetch = globalThis.fetch
+    try {
+      for (const stream of [false, true]) {
+        let calls = 0
+        globalThis.fetch = (async () => {
+          calls++
+          const body = { candidates: [{ finishReason: 'SAFETY' }] }
+          return stream
+            ? new Response(`data: ${JSON.stringify(body)}\r\n\r\n`, { headers: { 'Content-Type': 'text/event-stream' } })
+            : Response.json(body)
+        }) as unknown as typeof fetch
+        const response = await proxy(provider.id, {
+          model: 'gemini-4-argon-contributor', max_tokens: 32, stream, messages: [{ role: 'user', content: 'hello' }],
+        })
+        expect(response.status, `stream=${stream}`).toBe(200)
+        expect(await response.text(), `stream=${stream}`).toContain('"stop_reason":"refusal"')
+        expect(calls, `stream=${stream}`).toBe(1)
       }
     } finally {
       globalThis.fetch = originalFetch
