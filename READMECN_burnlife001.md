@@ -14,7 +14,9 @@
 
 ## 二、系统代理支持"绝对路径形式的 HTTPS 请求"
 
-桌面端的系统代理桥（SystemProxyBridge）原来只支持 HTTP 的绝对 URI 转发，遇到 HTTPS 绝对 URI 直接回 400 让客户端走 CONNECT。现在新增 `forwardAbsoluteUriHttps`：直接对目标主机建 TLS 连接、把请求改写成标准形式转发、响应原样写回。附带一批 TLS 测试证书和 195 行测试。
+桌面端的系统代理桥（SystemProxyBridge）原来只支持 HTTP 的绝对 URI 转发，遇到 HTTPS 绝对 URI 直接回 400 让客户端走 CONNECT。现在新增 `forwardAbsoluteUriHttps`：对目标主机建 TLS 连接、把请求改写成标准形式转发、响应原样写回。附带一批 TLS 测试证书和 195 行测试。
+
+走系统代理规则时也不会把请求明文交给代理：命中 http/https 代理先 `CONNECT` 建隧道再在隧道上跑 TLS；命中 SOCKS 则直接在 SOCKS 套接字上跑 TLS。
 
 > 简单说：某些客户端发 HTTPS 请求时不走 CONNECT 隧道，以前会挂，现在能正常通了。
 
