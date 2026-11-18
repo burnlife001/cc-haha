@@ -741,6 +741,7 @@ export const kr: Record<TranslationKey, string> = {
   "publicAccess.named": "고정 도메인",
   "publicAccess.quickHint": "계정이나 도메인이 필요 없습니다. 연결을 켜고 휴대폰으로 코드를 스캔한 다음 이 컴퓨터에서 승인하세요.",
   "publicAccess.quickAddressHint": "빠른 연결을 새로 만들 때마다 주소가 바뀝니다. 이 컴퓨터와 같은 Wi-Fi에 있는 휴대폰은 새 주소로 자동 전환되고, 알림을 켠 iPhone에도 새 주소가 전송됩니다. 그 밖의 경우에는 다시 스캔해야 합니다. 임시 사용을 위한 방식이며 지속적인 가용성은 보장되지 않습니다.",
+  "publicAccess.tunnelOriginSyncHint": "터널이 온라인이 되면 해당 주소가 H5 접근 허용 출처에 자동으로 추가됩니다. 즉시 적용되며 서버 재시작이 필요 없습니다.",
   "publicAccess.namedHint": "직접 만든 Cloudflare 터널을 사용해 재시작 후에도 같은 주소를 유지합니다.",
   "publicAccess.namedGuide": "고정 도메인 설정",
   "publicAccess.namedStepAccount": "Cloudflare에 로그인하고 소유한 도메인을 추가하세요.",

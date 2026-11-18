@@ -739,6 +739,7 @@ export const jp: Record<TranslationKey, string> = {
   "publicAccess.named": "固定ドメイン",
   "publicAccess.quickHint": "アカウントやドメインは不要です。接続を有効にし、スマートフォンでコードを読み取り、このパソコンで承認してください。",
   "publicAccess.quickAddressHint": "クイック接続を作り直すとアドレスが変わります。このコンピューターと同じ Wi-Fi にあるスマートフォンは自動で新しいアドレスに切り替わり、通知をオンにした iPhone にも新しいアドレスが届きます。それ以外は再度読み取ってください。一時利用向けで、継続的な可用性は保証されません。",
+  "publicAccess.tunnelOriginSyncHint": "接続がオンラインになると、そのアドレスが H5 アクセスの許可済みオリジンに自動追加されます。即時反映され、サーバーの再起動は不要です。",
   "publicAccess.namedHint": "自分で作成した Cloudflare Tunnel を使い、再起動後も同じアドレスを維持します。",
   "publicAccess.namedGuide": "固定ドメインを設定する",
   "publicAccess.namedStepAccount": "Cloudflare にログインし、所有するドメインを追加します。",

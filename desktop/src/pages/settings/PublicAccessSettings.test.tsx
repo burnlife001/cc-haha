@@ -751,3 +751,41 @@ it.each([
   await screen.findByRole('switch', { name: 'Allow direct phone connections (P2P)' })
   expect(screen.getByTestId('public-access-p2p-state')).toHaveTextContent(label)
 })
+
+it('adds the tunnel origin to the H5 allowed origins when the tunnel comes online', async () => {
+  mockOnline()
+  useSettingsStore.setState({
+    h5AccessError: null,
+    h5Access: { ...useSettingsStore.getState().h5Access, allowedOrigins: ['https://existing.example.com'] },
+  })
+  const fetchH5Access = vi.spyOn(useSettingsStore.getState(), 'fetchH5Access').mockResolvedValue(undefined)
+  const updateH5AccessSettings = vi.spyOn(useSettingsStore.getState(), 'updateH5AccessSettings').mockResolvedValue(undefined)
+  render(<PublicAccessSettings />)
+  await waitFor(() => expect(updateH5AccessSettings).toHaveBeenCalledWith({
+    allowedOrigins: ['https://existing.example.com', 'https://computer-fixture.trycloudflare.com'],
+  }))
+  expect(fetchH5Access).toHaveBeenCalled()
+})
+
+it('does not rewrite the H5 allowed origins when the tunnel origin is already listed', async () => {
+  mockOnline()
+  useSettingsStore.setState({
+    h5AccessError: null,
+    h5Access: { ...useSettingsStore.getState().h5Access, allowedOrigins: ['https://computer-fixture.trycloudflare.com'] },
+  })
+  vi.spyOn(useSettingsStore.getState(), 'fetchH5Access').mockResolvedValue(undefined)
+  const updateH5AccessSettings = vi.spyOn(useSettingsStore.getState(), 'updateH5AccessSettings').mockResolvedValue(undefined)
+  render(<PublicAccessSettings />)
+  await screen.findByRole('button', { name: /^(?:Copy address|Copy pairing link)$/ })
+  expect(updateH5AccessSettings).not.toHaveBeenCalled()
+})
+
+it('keeps the tunnel working when the H5 origin sync fails', async () => {
+  mockOnline()
+  useSettingsStore.setState({ h5AccessError: null })
+  vi.spyOn(useSettingsStore.getState(), 'fetchH5Access').mockRejectedValue(new Error('settings offline'))
+  const updateH5AccessSettings = vi.spyOn(useSettingsStore.getState(), 'updateH5AccessSettings').mockResolvedValue(undefined)
+  render(<PublicAccessSettings />)
+  await screen.findByRole('button', { name: /^(?:Copy address|Copy pairing link)$/ })
+  expect(updateH5AccessSettings).not.toHaveBeenCalled()
+})

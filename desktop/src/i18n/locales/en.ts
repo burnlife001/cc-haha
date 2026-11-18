@@ -738,6 +738,7 @@ export const en = {
   "publicAccess.named": "Fixed domain",
   "publicAccess.quickHint": "No account or domain needed. Enable the connection, scan the code, then approve your phone on this computer.",
   "publicAccess.quickAddressHint": "A new quick connection gets a new address. Phones on the same Wi-Fi as this computer switch to it automatically, and iPhones with notifications on are sent it; otherwise scan again. Quick connections are for temporary use and have no availability guarantee.",
+  "publicAccess.tunnelOriginSyncHint": "When the tunnel comes online, its address is added to the H5 access allowed origins automatically. It takes effect immediately — no server restart needed.",
   "publicAccess.namedHint": "Use a Cloudflare tunnel you create to keep the same address across restarts.",
   "publicAccess.namedGuide": "Set up your fixed domain",
   "publicAccess.namedStepAccount": "Sign in to Cloudflare and add a domain you own.",

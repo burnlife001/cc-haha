@@ -10,6 +10,7 @@ import { StatusDot } from '@/components/ui/Badge'
 import { Input } from '@/components/ui/Input'
 import { SegmentedControl } from '@/components/ui/SegmentedControl'
 import { useUIStore } from '@/stores/uiStore'
+import { useSettingsStore } from '@/stores/settingsStore'
 import {
   SettingsBlock,
   SettingsGroup,
@@ -81,6 +82,37 @@ export function PublicAccessSettings() {
     const timer = setTimeout(() => { setQr(null); setExpiresAt(null) }, Math.max(0, expiresAt - Date.now()))
     return () => clearTimeout(timer)
   }, [expiresAt])
+  // Every H5 page opened through the tunnel is served from the tunnel origin,
+  // so the H5 service must allow it. Sync the origin as soon as the tunnel is
+  // online; the H5 settings are read from disk per request, so this applies
+  // immediately — no server restart needed.
+  const syncedTunnelOrigin = useRef<string | null>(null)
+  useEffect(() => {
+    const publicUrl = status?.state === 'online' ? status.publicUrl : undefined
+    if (!publicUrl) return
+    let origin: string
+    try {
+      origin = new URL(publicUrl).origin
+    } catch {
+      return
+    }
+    if (syncedTunnelOrigin.current === origin) return
+    syncedTunnelOrigin.current = origin
+    void (async () => {
+      try {
+        await useSettingsStore.getState().fetchH5Access()
+        // A failed load falls back to stale in-memory settings; writing those
+        // back could clobber origins added elsewhere, so skip the update.
+        if (useSettingsStore.getState().h5AccessError) return
+        const current = useSettingsStore.getState().h5Access.allowedOrigins
+        if (current.includes(origin)) return
+        await useSettingsStore.getState().updateH5AccessSettings({ allowedOrigins: [...current, origin] })
+      } catch {
+        // Best-effort: public access itself works without it; only the H5 page
+        // served through the tunnel needs the origin in allowedOrigins.
+      }
+    })()
+  }, [status?.state, status?.publicUrl])
   const run = useCallback(async (action: (generation: number) => Promise<unknown>) => {
     const generation = ++actionGeneration.current
     setBusy(true)
@@ -309,6 +341,7 @@ export function PublicAccessSettings() {
         {online && status.publicUrl && (
           <SettingsBlock className="space-y-3">
             <p className="break-all rounded-[var(--radius-sm)] bg-[var(--color-surface-container)] px-2 py-1 font-mono text-xs text-[var(--color-text-primary)]">{status.publicUrl}/remote</p>
+            <p className="text-xs leading-5 text-[var(--color-text-tertiary)]">{t('publicAccess.tunnelOriginSyncHint')}</p>
             <div className="flex flex-wrap gap-2">
               <Button size="base" variant="secondary" disabled={busy} onClick={() => void run(async generation => {
                 const publicUrl = status.publicUrl!

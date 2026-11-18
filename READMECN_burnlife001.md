@@ -1,15 +1,16 @@
 # 本分支（burnlife001）与上游（NanmiCoder/cc-haha main）的差异说明
 
-## 一、修了两个"设置不生效"的真 Bug（最重要的改动）
+> 最近一次同步：上游 v0.7.8（`79b1bf9b`）。本分支已在 v0.7.8 基础上重新落地下列改动。
+> 逐项核对清单见 `BURNFILE-CUSTOMIZATIONS.md`（未跟踪文件）。
 
-上游代码里，桌面端把权限模式和思考强度存错了字段名，导致 CLI 根本读不到：
+## 一、默认权限模式与新会话默认值
 
-- **权限模式**：上游存在顶层的 `defaultMode`，但 CLI 只认 `permissions.defaultMode`——所以你在界面上改了权限模式，实际运行完全没变化。现在改成写入 `permissions.defaultMode`。
-- **思考强度（effort）**：上游存在 `effort`，CLI 只认 `effortLevel`——同理，改了不生效。现在统一用 `effortLevel`。
+上游 v0.7.8 已经把桌面端的设置字段名统一成 CLI 能识别的写法（顶层 `defaultMode`、`effort` / `effortLevel` 双键），之前"改了设置不生效"的字段名 bug 在上游已修复，本分支不再重复改字段名，也不再做 `defaultMode → permissions.defaultMode` 的存量迁移。
 
-配套做了一次**存量数据自动迁移**：启动时检查 `settings.json`，把旧的 `defaultMode`、`effort` 搬到新字段（已有新字段的不会被旧值覆盖），老用户升级后设置无缝衔接。
+本分支保留的是**默认行为**上的差异：
 
-涉及文件：`src/server/services/settingsService.ts`、`persistentStorageMigrations.ts`、`api/models.ts`、`ws/handler.ts`，外加迁移和设置的回归测试。
+- `SettingsService.getPermissionMode()` 的缺省值从 `default` 改成 `bypassPermissions`：没有显式配置过的用户默认放开权限。
+- 新会话启动时强制 `bypassPermissions` + `effort: 'high'`（`ConversationService.startSession`）。显式传了非 `default` 的权限模式（例如 `plan`）就尊重调用方。
 
 ## 二、系统代理支持"绝对路径形式的 HTTPS 请求"
 
@@ -30,20 +31,36 @@
 
 `desktop/scripts/build-windows-x64.ps1` 里原来用 `bunx` 跑 electron-builder，但 bun 在 NodeModuleCollector 遍历时会静默崩溃。改成直接用 `node` 调 electron-builder 的 CLI 入口。纯构建环境问题修复，不影响功能。
 
+`desktop/package.json` 里 `electron-builder` 升到 `^26.18.0`，并配置了本机 electron 下载缓存（`electronDownload.cache`，仅本机路径，换机器要删）。
+
 ## 五、飞书适配器：兼容单语言 Post 消息
 
 飞书富文本（post 类型）上游只解析多语言结构（`zh_cn`/`en_us` 包裹），遇到单语言直出的 `{title, content}` 结构会解析出空内容。现在两种结构都兼容。
 
-## 六、个人工具脚本（不属于产品改动）
+## 六、工具 schema 与隧道地址自动放行
+
+- `src/utils/zodToJsonSchema.ts`：工具入参是 union 且每个分支都是 object 时，把 `type: "object"` 提升到顶层（Anthropic API 要求顶层声明 object）。
+- 隧道地址自动进 H5 白名单：`PublicAccessSettings` 在隧道上线后，把 `publicUrl` 的 origin 自动加进 H5 访问的 `allowedOrigins`，通过隧道访问的 H5 页面因此不会被 Origin 校验拦住。同步是尽力而为，失败不影响隧道本身。
+
+## 七、个人工具脚本（不属于产品改动）
 
 - `__scripts/__cc-haha-op.sh`：个人的仓库操作菜单脚本（同步 upstream、构建 Windows 包等）。
-- `__scripts/fix-cc-haha-h5-admin.ps1`（未提交）：手动配防火墙的补救脚本，自动提权 + 探测端口，供安装程序没配成功时用。
-- `preview-agent.js`：本地重新打包的压缩产物，仅压缩变量名重排，无逻辑变化。
+- `__scripts/fix-cc-haha-h5-admin.ps1`：手动配防火墙的补救脚本，自动提权 + 探测端口，供安装程序没配成功时用。
+- `__scripts/cloudflared-service-instal-admin.ps1`：cloudflared 服务注册（管理员）。
+- `preview-agent.js`：本地重新打包的产物，含预览页的缩放控件 UI。
 - `.gitignore`：放行测试用的回环 TLS 证书文件（`__fixtures__/*.pem/*.key`）。
+
+## 本次同步记录（2026-11-18）
+
+- `main` 合并上游 `upstream/main`（v0.7.8，`79b1bf9b`），冲突按 `BURNFILE-CUSTOMIZATIONS.md` 处理：
+  - 丢弃本地已过期的 `effort` 键位改动与 `defaultMode → permissions.defaultMode` 搬家（上游已实现）。
+  - 保留默认权限模式 `bypassPermissions`、新会话 `effort: high`、系统代理 absolute-URI HTTPS、飞书单语言 post、Windows 防火墙规则、构建脚本改用 node 等本分支特性。
+  - `desktop/package.json` 的顶层 `artifactName` 丢弃（上游已改为按平台分别配置），保留本机 electron 缓存与 electron-builder 版本升级。
+- `burnlife001` 已 rebase 到最新的 `main`，两者内容一致。
 
 ## 一句话总结
 
 这个分支相对上游干了三件事：
-**修了权限模式和思考强度"改了不生效"的设置字段 bug（含老数据自动迁移）
-**、**让系统代理能处理非 CONNECT 的 HTTPS 请求**、
-**让 Windows 装完就能用手机访问 H5（自动防火墙规则）**，外加一些构建环境和飞书消息兼容的小修。
+**把默认权限放开（默认 `bypassPermissions`、新会话 `effort=high`）**、
+**让系统代理能处理非 CONNECT 的 HTTPS 请求**、
+**让 Windows 装完就能用手机访问 H5（自动防火墙规则 + 隧道地址自动进白名单）**，外加一些构建环境、工具 schema 和飞书消息兼容的小修。

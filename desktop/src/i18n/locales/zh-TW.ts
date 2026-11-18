@@ -739,6 +739,7 @@ export const zh: Record<TranslationKey, string> = {
   "publicAccess.named": "固定網域",
   "publicAccess.quickHint": "無需帳號或網域。開啟連線後用手機掃碼，再在這台電腦上批准。",
   "publicAccess.quickAddressHint": "每次重新建立快速連線都會更換位址。手機和電腦在同一個 Wi-Fi 時會自動換到新位址，開啟通知的 iPhone 也會收到新位址；其他情況需要重新掃碼。快速連線適合臨時使用，不保證持續可用。",
+  "publicAccess.tunnelOriginSyncHint": "連線上線後會自動將該位址加入 H5 存取的允許來源，立即生效，無需重新啟動服務。",
   "publicAccess.namedHint": "使用你建立的 Cloudflare 隧道，重新啟動後仍保持相同位址。",
   "publicAccess.namedGuide": "設定你的固定網域",
   "publicAccess.namedStepAccount": "登入 Cloudflare，並新增你擁有的網域。",

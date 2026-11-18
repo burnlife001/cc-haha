@@ -738,6 +738,7 @@ export const zh: Record<TranslationKey, string> = {
   "publicAccess.named": "固定域名",
   "publicAccess.quickHint": "无需账号或域名。开启连接后用手机扫码，再在这台电脑上批准。",
   "publicAccess.quickAddressHint": "每次重新建立快速连接都会换地址。手机和电脑在同一个 Wi-Fi 时会自动换到新地址，开了通知的 iPhone 也会收到新地址；其他情况需要重新扫码。快速连接适合临时使用，不保证持续可用。",
+  "publicAccess.tunnelOriginSyncHint": "隧道上线后会自动把该地址加入 H5 访问的允许来源，立即生效，无需重启服务。",
   "publicAccess.namedHint": "使用你创建的 Cloudflare 隧道，重启后仍保持同一个地址。",
   "publicAccess.namedGuide": "配置你的固定域名",
   "publicAccess.namedStepAccount": "登录 Cloudflare，并添加你拥有的域名。",
