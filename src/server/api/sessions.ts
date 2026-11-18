@@ -1,4 +1,5 @@
 import { handleSideChatsRoute } from './sideChats.js'
+import { emitSessionTurnEvent } from '../services/sessionTurnEvents.js'
 /**
  * Session REST API Routes
  *
@@ -36,6 +37,8 @@ import { sessionService } from '../services/sessionService.js'
 import { loadRenderedToolImage } from '../services/toolImageMedia.js'
 import { projectSessionBackgroundActivity, readSessionBackgroundTaskOutputFromTranscript } from '../services/sessionBackgroundActivity.js'
 import { getMobileSessionActivity } from '../services/mobileSessionActivityRuntime.js'
+import { getPowerActivitySnapshot } from '../services/powerActivityRuntime.js'
+import { handlePowerActivityLease } from '../services/powerActivityLease.js'
 import { conversationService } from '../services/conversationService.js'
 import { endTeamsForParent } from '../services/teamPlanRuntime.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
@@ -45,6 +48,7 @@ import {
   getSlashCommands,
   listLiveSessionActivity,
   assertSessionCanArchive,
+  runSessionRewind,
 } from '../ws/handler.js'
 import { listSkillSlashCommands, type SkillSlashCommand } from './skills.js'
 import { WorkspaceService, type WorkspaceRawFile } from '../services/workspaceService.js'
@@ -53,6 +57,7 @@ import {
   createRepositoryBranch,
   getRepositoryContext,
   type CreateSessionRepositoryOptions,
+  type RepositoryContextResult,
 } from '../services/repositoryLaunchService.js'
 import {
   executeSessionRewind,
@@ -68,6 +73,7 @@ import {
   SessionBranchingError,
 } from '../../utils/sessionBranching.js'
 import { registerChangedFileAccessRoot, registerFilesystemAccessRoot } from '../services/filesystemAccessRoots.js'
+import { findExplicitProjectRoot, readProjectIdentity } from '../services/projectIdentity.js'
 import { findGitRoot } from '../../utils/git.js'
 import { traceCaptureService, trimTraceCallPreviews } from '../services/traceCaptureService.js'
 import { getSubagentRunByAgentId, getSubagentRunByTool } from '../services/subagentRunService.js'
@@ -156,6 +162,12 @@ export async function handleSessionsApi(
         )
       }
       return await batchDeleteSessions(req)
+    }
+
+    if (sessionId === 'power-activity-lease') return handlePowerActivityLease(req)
+    if (sessionId === 'power-activity') {
+      if (req.method !== 'GET') return Response.json({ error: 'METHOD_NOT_ALLOWED' }, { status: 405 })
+      return Response.json(await getPowerActivitySnapshot(), { headers: { 'Cache-Control': 'no-store' } })
     }
 
     // Special collection route: /api/sessions/live-status
@@ -1039,11 +1051,15 @@ async function getSessionRepositoryContext(url: URL): Promise<Response> {
     throw ApiError.badRequest('workDir query parameter is required')
   }
 
-  const context = await getRepositoryContext(workDir)
-  registerFilesystemAccessRoot(workDir)
-  registerFilesystemAccessRoot(context.workDir)
-  registerFilesystemAccessRoot(context.repoRoot)
-  return Response.json(context)
+  return Response.json(withProjectIdentity(await getRepositoryContext(workDir)))
+}
+
+function withProjectIdentity(context: RepositoryContextResult): RepositoryContextResult & { projectRoot: string } {
+  const explicitRoot = findExplicitProjectRoot(context.workDir, readProjectIdentity(getClaudeConfigHomeDir()).roots)
+  const projectRoot = explicitRoot && (!context.repoRoot || findExplicitProjectRoot(explicitRoot, [context.repoRoot]))
+    ? explicitRoot
+    : context.repoRoot || context.workDir
+  return { ...context, projectRoot }
 }
 
 async function createSessionRepositoryBranch(req: Request): Promise<Response> {
@@ -1071,7 +1087,7 @@ async function createSessionRepositoryBranch(req: Request): Promise<Response> {
     name: body.name,
     from: body.from ?? null,
   })
-  return Response.json(result, { status: 201 })
+  return Response.json({ ...result, context: withProjectIdentity(result.context) }, { status: 201 })
 }
 
 async function requireSessionWorkspace(sessionId: string): Promise<string> {
@@ -1212,6 +1228,7 @@ async function deleteSession(sessionId: string): Promise<Response> {
     throw error
   }
   closeSessionConnection(sessionId, 'session deleted')
+  emitSessionTurnEvent({ type: 'deleted', sessionId })
   cleanupAdapterSessionMappings(sessionId)
   recentProjectsCache = null
   // A deleted lead ends its reviewed team for good; Stop and lead restarts only pause it.
@@ -1237,6 +1254,7 @@ async function batchDeleteSessions(req: Request): Promise<Response> {
 
   for (const sessionId of result.successes) {
     closeSessionConnection(sessionId, 'session deleted')
+    emitSessionTurnEvent({ type: 'deleted', sessionId })
     cleanupAdapterSessionMappings(sessionId)
     void endTeamsForParent(sessionId).catch(error => console.error(`[Sessions] Failed to end the deleted session's team: ${error}`))
   }
@@ -1299,6 +1317,7 @@ function mergeSessionSlashCommands(
       ...(argumentHint ? { argumentHint } : {}),
       kind: fallbackCommand?.kind ?? 'command',
       ...(fallbackCommand?.source ? { source: fallbackCommand.source } : {}),
+      ...(fallbackCommand?.leanCompatible === false ? { leanCompatible: false } : {}),
     })
   }
 
@@ -1331,29 +1350,73 @@ async function getSessionSlashCommands(sessionId: string): Promise<Response> {
 }
 
 async function getSessionInspection(req: Request, sessionId: string, url: URL): Promise<Response> {
-  const includeContext = url.searchParams.get('includeContext') !== '0'
+  const statusOnly = url.searchParams.get('statusOnly') === '1'
+  const includeContext = !statusOnly && url.searchParams.get('includeContext') !== '0'
   const contextOnly = includeContext && url.searchParams.get('contextOnly') === '1'
+  const summaryOnly = contextOnly && url.searchParams.get('summaryOnly') === '1'
   // Lightweight polling mode for the context panel: one `get_session_usage` control and
   // nothing else. The full inspection also scans the skills directory and re-reads the whole
   // transcript to cross-check usage, which is far too much work to repeat every few seconds.
-  const usageOnly = !includeContext && url.searchParams.get('usageOnly') === '1'
+  const usageOnly = !statusOnly && !includeContext && url.searchParams.get('usageOnly') === '1'
   let transcriptSnapshot: Awaited<ReturnType<typeof sessionService.getInspectionTranscriptSnapshot>> | undefined
+  let transcriptLimit: string | undefined
   const getTranscriptSnapshot = async () => {
     if (transcriptSnapshot !== undefined) return transcriptSnapshot
-    transcriptSnapshot = await sessionService.getInspectionTranscriptSnapshot(sessionId)
+    try {
+      transcriptSnapshot = await sessionService.getInspectionTranscriptSnapshot(sessionId)
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== 'HISTORY_INSPECTION_LIMIT') throw error
+      // Keep live data and launch metadata available when historical totals cannot be verified.
+      transcriptLimit = error.message
+      transcriptSnapshot = null
+    }
     return transcriptSnapshot
   }
 
   const active = conversationService.hasSession(sessionId)
-  const workDir =
-    conversationService.getSessionWorkDir(sessionId) ||
-    (await getTranscriptSnapshot())?.launchInfo.workDir
+  const liveWorkDir = conversationService.getSessionWorkDir(sessionId)
+  const needsLaunchInfo = !active || !liveWorkDir
+  const persistedStatus = statusOnly && needsLaunchInfo ? await sessionService.getSessionStatusMetadata(sessionId) : null
+  const launchInfo = statusOnly
+    ? persistedStatus?.launchInfo
+    : needsLaunchInfo
+      ? (await getTranscriptSnapshot())?.launchInfo
+        ?? (transcriptLimit ? await sessionService.getSessionLaunchInfo(sessionId) : null)
+      : null
+  const workDir = liveWorkDir || launchInfo?.workDir
 
   if (!workDir) {
     throw ApiError.notFound(`Session not found: ${sessionId}`)
   }
 
-  const launchInfo = !active ? (await getTranscriptSnapshot())?.launchInfo ?? null : null
+  // The composer meter needs the runtime's compaction counter, not a full
+  // inspection. Keep this ahead of skill discovery and transcript metadata;
+  // if the CLI is busy, the client retains its previous confirmed reading.
+  if (active && summaryOnly) {
+    const errors: Record<string, string> = {}
+    const response: Record<string, unknown> = {
+      active,
+      status: {
+        sessionId,
+        workDir,
+        permissionMode: conversationService.getSessionPermissionMode(sessionId),
+      },
+      errors,
+    }
+    try {
+      response.context = await conversationService.requestControl(
+        sessionId,
+        { subtype: 'get_context_usage', estimateOnly: true, summaryOnly: true },
+        5_000,
+        req.signal,
+      )
+    } catch (error) {
+      throwIfRequestAborted(req)
+      errors.context = error instanceof Error ? error.message : String(error)
+    }
+    return Response.json(response)
+  }
+
   const permissionMode = active
     ? conversationService.getSessionPermissionMode(sessionId)
     : launchInfo?.permissionMode ?? 'default'
@@ -1361,14 +1424,26 @@ async function getSessionInspection(req: Request, sessionId: string, url: URL): 
     [...conversationService.getRecentSdkMessages(sessionId)]
     .reverse()
     .find((message) => message?.type === 'system' && message.subtype === 'init')
-  const transcriptMetadata = !usageOnly && (!active || !initMessage)
-    ? (await getTranscriptSnapshot())?.metadata ?? null
-    : null
+  const transcriptMetadata = statusOnly
+    ? persistedStatus?.transcriptMetadata
+    : !usageOnly && (!active || !initMessage)
+      ? (await getTranscriptSnapshot())?.metadata
+      : undefined
+  const liveRuntime = statusOnly && active ? conversationService.getSessionRuntimeSelection(sessionId) : undefined
+  const model = typeof initMessage?.model === 'string'
+    ? initMessage.model
+    : transcriptMetadata?.model ?? (statusOnly ? liveRuntime?.modelId ?? launchInfo?.runtimeModelId : undefined)
+  const contextWindow = statusOnly && model
+    ? await sessionService.getSessionModelContextWindow(sessionId, model, launchInfo ?? {
+      runtimeProviderId: liveRuntime?.providerId,
+      runtimeModelId: liveRuntime?.modelId,
+    })
+    : undefined
   const cachedSlashCommands = getSlashCommands(sessionId)
   const hasCliSlashCommands = cachedSlashCommands.length > 0
   // `listSkillSlashCommands` walks every skill directory on disk with no cache. The usage
   // poll does not need a command count, so it must not pay for one.
-  const fallbackSlashCommands = usageOnly
+  const fallbackSlashCommands = usageOnly || contextOnly
     ? []
     : hasCliSlashCommands
       ? mergeSessionSlashCommands(
@@ -1380,6 +1455,7 @@ async function getSessionInspection(req: Request, sessionId: string, url: URL): 
     ? initMessage.slash_commands.length
     : fallbackSlashCommands.length
 
+  const errors: Record<string, string> = {}
   const response: Record<string, unknown> = {
     active,
     status: {
@@ -1388,7 +1464,8 @@ async function getSessionInspection(req: Request, sessionId: string, url: URL): 
       permissionMode,
       version: typeof initMessage?.claude_code_version === 'string' ? initMessage.claude_code_version : transcriptMetadata?.version,
       cwd: typeof initMessage?.cwd === 'string' ? initMessage.cwd : transcriptMetadata?.cwd ?? workDir,
-      model: typeof initMessage?.model === 'string' ? initMessage.model : transcriptMetadata?.model,
+      model,
+      contextWindow,
       apiKeySource: typeof initMessage?.apiKeySource === 'string' ? initMessage.apiKeySource : undefined,
       outputStyle: typeof initMessage?.output_style === 'string' ? initMessage.output_style : undefined,
       tools: Array.isArray(initMessage?.tools) ? initMessage.tools : [],
@@ -1396,10 +1473,11 @@ async function getSessionInspection(req: Request, sessionId: string, url: URL): 
       slashCommandCount,
       skillCount: Array.isArray(initMessage?.skills) ? initMessage.skills.length : 0,
     },
-    errors: {},
+    errors,
   }
 
   if (!active) {
+    if (statusOnly) return Response.json(response)
     const snapshot = await getTranscriptSnapshot()
     const transcriptUsage = snapshot?.usage ?? null
     const transcriptContextEstimate = snapshot?.contextEstimate ?? null
@@ -1408,15 +1486,13 @@ async function getSessionInspection(req: Request, sessionId: string, url: URL): 
     }
     if (transcriptUsage) {
       response.usage = transcriptUsage
+    } else {
+      errors.usage = transcriptLimit ?? 'CLI session is not running'
     }
-    response.errors = {
-      ...(transcriptUsage ? {} : { usage: 'CLI session is not running' }),
-      ...(includeContext ? { context: 'CLI session is not running' } : {}),
-    }
+    if (includeContext) errors.context = transcriptLimit ?? 'CLI session is not running'
     return Response.json(response)
   }
 
-  const errors: Record<string, string> = {}
   if (usageOnly) {
     // No `mcp_status`, no skills scan, and deliberately no transcript cross-check: the
     // transcript re-read is what made this endpoint too expensive to poll. The CLI's own
@@ -1435,7 +1511,6 @@ async function getSessionInspection(req: Request, sessionId: string, url: URL): 
       throwIfRequestAborted(req)
       errors.usage = error instanceof Error ? error.message : String(error)
     }
-    response.errors = errors
     return Response.json(response)
   }
 
@@ -1451,16 +1526,12 @@ async function getSessionInspection(req: Request, sessionId: string, url: URL): 
       throwIfRequestAborted(req)
       errors.context = error instanceof Error ? error.message : String(error)
     }
-    if (!response.context) {
-      const transcriptContextEstimate = (await getTranscriptSnapshot())?.contextEstimate ?? null
-      if (transcriptContextEstimate) {
-        response.contextEstimate = transcriptContextEstimate
-      }
-    }
   } else {
     const basicControlTimeoutMs = includeContext ? 10_000 : 4_000
     const [usageResult, contextResult, mcpResult] = await Promise.allSettled([
-      conversationService.requestControl(sessionId, { subtype: 'get_session_usage' }, basicControlTimeoutMs, req.signal),
+      statusOnly
+        ? Promise.resolve(null)
+        : conversationService.requestControl(sessionId, { subtype: 'get_session_usage' }, basicControlTimeoutMs, req.signal),
       includeContext
         ? conversationService.requestControl(
             sessionId,
@@ -1473,32 +1544,24 @@ async function getSessionInspection(req: Request, sessionId: string, url: URL): 
     ])
     throwIfRequestAborted(req)
 
-    if (usageResult.status === 'fulfilled') {
+    if (!statusOnly) {
       const transcriptUsage = (await getTranscriptSnapshot())?.usage ?? null
-      response.usage = chooseRicherUsage(
-        { ...usageResult.value, source: 'current_process' },
-        transcriptUsage,
-      )
-    } else {
-      const transcriptUsage = (await getTranscriptSnapshot())?.usage ?? null
-      if (transcriptUsage) {
+      if (usageResult.status === 'fulfilled') {
+        response.usage = chooseRicherUsage(
+          { ...usageResult.value, source: 'current_process' },
+          transcriptUsage,
+        )
+      } else if (transcriptUsage) {
         response.usage = transcriptUsage
       } else {
-        errors.usage = usageResult.reason instanceof Error ? usageResult.reason.message : String(usageResult.reason)
+        errors.usage = transcriptLimit ?? (usageResult.reason instanceof Error ? usageResult.reason.message : String(usageResult.reason))
       }
     }
 
-    if (!includeContext) {
-      // Context can be expensive on large live sessions. The desktop UI loads it
-      // separately when the context tab is actually selected.
-    } else if (contextResult.status === 'fulfilled' && contextResult.value) {
+    if (contextResult.status === 'fulfilled' && contextResult.value) {
       response.context = contextResult.value
-    } else {
+    } else if (contextResult.status === 'rejected') {
       errors.context = contextResult.reason instanceof Error ? contextResult.reason.message : String(contextResult.reason)
-      const transcriptContextEstimate = (await getTranscriptSnapshot())?.contextEstimate ?? null
-      if (transcriptContextEstimate) {
-        response.contextEstimate = transcriptContextEstimate
-      }
     }
 
     if (mcpResult.status === 'fulfilled' && response.status && typeof response.status === 'object') {
@@ -1509,7 +1572,11 @@ async function getSessionInspection(req: Request, sessionId: string, url: URL): 
     }
   }
 
-  response.errors = errors
+  if (includeContext && !response.context) {
+    const estimate = (await getTranscriptSnapshot())?.contextEstimate
+    if (estimate) response.contextEstimate = estimate
+    else if (transcriptLimit) errors.context = transcriptLimit
+  }
   return Response.json(response)
 }
 
@@ -1615,15 +1682,23 @@ async function getGitInfo(sessionId: string): Promise<Response> {
   const launchInfo = await sessionService.getSessionLaunchInfo(sessionId).catch(() => null)
   const repository = launchInfo?.repository
   const worktreeSession = launchInfo?.worktreeSession
-  // The visible business branch comes from Desktop's launch choice when present.
-  // CLI originalBranch is the source checkout before creating the worktree, which
-  // can differ from the selected base ref.
-  const sessionBranch = repository?.branch || worktreeSession?.originalBranch || null
+  const preferRepositoryBranch =
+    Boolean(repository?.worktree) &&
+    (!worktreeSession || sameResolvedPath(worktreeSession.worktreePath, repository.worktreePath))
+  // The visible business branch comes from Desktop's isolated worktree launch choice
+  // when it still matches the active worktree. Regular checkouts and subsequent CLI
+  // EnterWorktree transitions prefer CLI originalBranch over stale launch metadata.
+  const sessionBranch = preferRepositoryBranch
+    ? (repository?.branch || worktreeSession?.originalBranch || null)
+    : (worktreeSession?.originalBranch || null)
   const plannedWorktreePath = worktreeSession?.worktreePath || repository?.worktreePath || null
   const activeWorktreePath = worktreeSession?.worktreePath || (
     sameResolvedPath(workDir, plannedWorktreePath) ? workDir : null
   )
-  const worktree = repository?.worktree || worktreeSession
+  const hasActiveOrPlannedWorktree = Boolean(worktreeSession) || (
+    Boolean(repository?.worktree) && worktreeSession !== null
+  )
+  const worktree = hasActiveOrPlannedWorktree
     ? {
         enabled: true,
         path: activeWorktreePath,
@@ -1641,7 +1716,7 @@ async function getGitInfo(sessionId: string): Promise<Response> {
   if (!gitRoot) {
     const dirName = repoNameFromWorkDir(workDir)
     return Response.json({
-      branch: sessionBranch,
+      branch: worktree ? sessionBranch : null,
       repoName: dirName,
       workDir,
       changedFiles: 0,
@@ -1650,17 +1725,37 @@ async function getGitInfo(sessionId: string): Promise<Response> {
   }
 
   try {
-    // Get branch name
-    const gitBranch = await runGitInfoCommand(workDir, ['rev-parse', '--abbrev-ref', 'HEAD'])
+    // `branch --show-current` reports the live branch on normal and unborn checkouts,
+    // empty stdout (`''`) on detached HEAD, and `null` when git fails or times out.
+    const rawGitBranch = await runGitInfoCommand(workDir, ['branch', '--show-current'])
+    const isDetachedHead = rawGitBranch === ''
+    const gitBranch = rawGitBranch || null
     const materializedWorktree = !!worktree && (
       sameResolvedPath(workDir, worktree.path) ||
       sameResolvedPath(workDir, worktree.plannedPath)
     )
-    const branch = sessionBranch || (
-      materializedWorktree
-        ? (worktree.branch || gitBranch)
-        : gitBranch
-    )
+    const plannedUnmaterializedWorktree = !!worktree &&
+      !materializedWorktree &&
+      (launchInfo?.transcriptMessageCount ?? 0) === 0 &&
+      !!repository?.worktree &&
+      worktreeSession !== null
+
+    let branch: string | null
+    if (plannedUnmaterializedWorktree) {
+      branch = sessionBranch || gitBranch
+    } else if (materializedWorktree) {
+      if (isDetachedHead) {
+        branch = null
+      } else if (rawGitBranch === null) {
+        branch = sessionBranch || worktree.branch || null
+      } else if (worktree.branch && gitBranch === worktree.branch) {
+        branch = sessionBranch || worktree.branch
+      } else {
+        branch = gitBranch
+      }
+    } else {
+      branch = gitBranch
+    }
 
     // Get repo name from remote or directory
     const remote = await runGitInfoCommand(workDir, ['remote', 'get-url', 'origin'])
@@ -1680,7 +1775,7 @@ async function getGitInfo(sessionId: string): Promise<Response> {
   } catch {
     // Not a git repo or git not available
     return Response.json({
-      branch: sessionBranch,
+      branch: worktree ? sessionBranch : null,
       repoName: null,
       workDir,
       changedFiles: 0,
@@ -1707,7 +1802,7 @@ async function rewindSession(req: Request, sessionId: string): Promise<Response>
   const mode = parseSessionRewindMode(body.mode)
   const result = body.dryRun
     ? await previewSessionRewind(sessionId, body)
-    : await executeSessionRewind(sessionId, body, mode)
+    : await runSessionRewind(sessionId, stopRuntime => executeSessionRewind(sessionId, body, mode, stopRuntime))
 
   return Response.json(result)
 }
@@ -1839,6 +1934,7 @@ type RecentProjectEntry = {
 
 // In-memory cache for recent projects (TTL: 30s)
 let recentProjectsCache: {
+  identityRevision: string
   scope: string
   /** How many sessions were scanned to build `projects` — see getRecentProjects. */
   scanLimit: number
@@ -1867,12 +1963,14 @@ async function getRecentProjects(url: URL): Promise<Response> {
     ? Math.min(Math.max(scanParam, 100), 5000)
     : Math.min(Math.max(limit * 16, 100), 500)
   const scope = path.resolve(getClaudeConfigHomeDir())
+  const identityRevision = readProjectIdentity(scope).revision
 
   // Return cached response if fresh. The cache is only valid for requests whose
   // scan depth it already covers — a shallow (small-limit) scan must not serve
   // a deeper one, or older projects would be silently truncated away.
   if (
     recentProjectsCache?.scope === scope &&
+    recentProjectsCache.identityRevision === identityRevision &&
     recentProjectsCache.scanLimit >= sessionScanLimit &&
     Date.now() - recentProjectsCache.timestamp < RECENT_PROJECTS_CACHE_TTL
   ) {
@@ -1982,6 +2080,6 @@ async function getRecentProjects(url: URL): Promise<Response> {
   // Sort by most recent
   projects.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt))
 
-  recentProjectsCache = { scope, scanLimit: sessionScanLimit, projects, timestamp: Date.now() }
+  recentProjectsCache = { scope, identityRevision, scanLimit: sessionScanLimit, projects, timestamp: Date.now() }
   return Response.json({ projects: projects.slice(0, limit) })
 }

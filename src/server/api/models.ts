@@ -54,7 +54,9 @@ import {
 } from '../services/providerRuntimeEnv.js'
 import {
   getModelReasoningCapabilityOverride,
+  isSchemaEffortLevel,
   MODEL_REASONING_EFFORTS,
+  resolveConfiguredEffortSetting,
   resolveModelReasoningProfile,
   type ModelReasoningApiFormat,
   type ModelReasoningProviderKind,
@@ -79,6 +81,8 @@ type ApiModelInfo = {
   name: string
   description: string
   context: string
+  /** Highest window a user may set for this model, when the catalog states one. */
+  maxContext?: string
   defaultReasoningEffort?: string
   supportedReasoningEfforts?: string[]
 }
@@ -160,6 +164,7 @@ function buildOpenAIModelList(catalog: OpenAIModelCatalogEntry[]): ApiModelInfo[
     name: model.label,
     description: model.description,
     context: model.contextWindow ? String(model.contextWindow) : '',
+    ...(model.maxContextWindow ? { maxContext: String(model.maxContextWindow) } : {}),
     defaultReasoningEffort: model.defaultReasoningEffort,
     supportedReasoningEfforts: model.supportedReasoningEfforts,
   }))
@@ -543,7 +548,11 @@ async function handleCurrentModel(req: Request): Promise<Response> {
 async function handleEffort(req: Request): Promise<Response> {
   if (req.method === 'GET') {
     const settings = await settingsService.getUserSettings()
-    const level = normalizeEffortLevel(settings.effortLevel)
+    const level = normalizeEffortLevel(
+      resolveConfiguredEffortSetting(settings, {
+        allowAntMaxEffortLevel: process.env.USER_TYPE === 'ant',
+      }),
+    )
     return Response.json({ level, available: EFFORT_LEVELS })
   }
 
@@ -558,7 +567,10 @@ async function handleEffort(req: Request): Promise<Response> {
         `Invalid effort level: "${level}". Valid levels: ${EFFORT_LEVELS.join(', ')}`,
       )
     }
-    await settingsService.updateUserSettings({ effortLevel: level })
+    await settingsService.updateUserSettings({
+      effort: level,
+      effortLevel: isSchemaEffortLevel(level) ? level : undefined,
+    })
     return Response.json({ ok: true, level })
   }
 

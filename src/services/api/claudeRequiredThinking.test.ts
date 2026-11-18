@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import semver from 'semver'
 import {
   getIsInteractive,
   setIsInteractive,
@@ -664,12 +665,15 @@ test('normalizes a disabled parent thinking mode to adaptive for Fable', async (
   expect(requests[0]?.thinking).not.toEqual({ type: 'disabled' })
 }, 10_000)
 
-for (const [disableBetas, disableAdaptive] of [[false, false], [true, false], [false, true]]) {
-  test(`keeps Fable 5.1 replay usable after a system change (disable betas: ${disableBetas}, adaptive: ${disableAdaptive})`, async () => {
+for (const [fableModel, disableBetas, disableAdaptive] of [
+  ['claude-fable-5-1', false, false], ['claude-fable-5-1', true, false], ['claude-fable-5-1', false, true],
+  ['claude-fable-5-2', false, false], ['claude-fable-5-2', true, false], ['claude-fable-5-2', false, true],
+] as const) {
+  test(`keeps ${fableModel} replay usable after a system change (disable betas: ${disableBetas}, adaptive: ${disableAdaptive})`, async () => {
     let originalSystem: string | undefined
     let responseIndex = 0
     const { content, requests, requestHeaders } = await captureQueryRequest({
-      model: 'claude-fable-5-1',
+      model: fableModel,
       configureCapabilityOverrides: false,
       continuationSystemPrompts: [[], ['Additional working directories: /tmp/project-two']],
       env: {
@@ -697,7 +701,7 @@ for (const [disableBetas, disableAdaptive] of [[false, false], [true, false], [f
     expect(content).toContainEqual({ type: 'text', text: 'OK' })
     expect(requests).toHaveLength(3)
     for (let index = 0; index < requests.length; index++) {
-      expect(requests[index]?.model).toBe('claude-fable-5-1')
+      expect(requests[index]?.model).toBe(fableModel)
       expect(requests[index]?.thinking).toEqual({
         type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'drop_block' },
       })
@@ -1052,11 +1056,52 @@ for (const disableAdaptive of [false, true]) {
       `cc_version=${CLAUDE_CODE_COMPAT_VERSION}`,
     )
     expect(JSON.stringify(requests[0]?.system)).toContain('cc_entrypoint=cli;')
-    // The SDK release the Claude Code CLI ships (2.1.288 uses 0.128.0); its
+    // The SDK release the Claude Code CLI ships (2.1.321 uses 0.128.0); its
     // stainless headers are part of the request's client identity.
     expect(requestHeaders[0]?.get('x-stainless-package-version')).toBe('0.128.0')
   }, 10_000)
 }
+
+test('Fable 5.2 sends >= 2.1.290 Claude Code wire identity on streaming requests', async () => {
+  const { content, requests, requestHeaders } = await captureQueryRequest({
+    model: 'claude-fable-5-2',
+    configureCapabilityOverrides: false,
+    env: {
+      CLAUDE_CODE_ATTRIBUTION_HEADER: '1',
+    },
+    responseFactory: (model, body, headers) => {
+      const uaVersion = headers.get('user-agent')?.match(/^claude-cli\/(\d+\.\d+\.\d+)\b/)?.[1]
+      const ccVersion = JSON.stringify(body.system).match(
+        /x-anthropic-billing-header: cc_version=(\d+\.\d+\.\d+)\.[0-9a-f]+; cc_entrypoint=cli;/,
+      )?.[1]
+      if (!uaVersion || !ccVersion || semver.lt(uaVersion, '2.1.290') || semver.lt(ccVersion, '2.1.290')) {
+        return Response.json({
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: `Claude Code ${uaVersion ?? ccVersion ?? 'unknown'} does not support this model; version 2.1.290 or newer is required. Run 'claude update', or update the Claude desktop app, then try again.`,
+          },
+        }, { status: 400 })
+      }
+      return new Response(successfulResponse(model), {
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    },
+  })
+
+  expect(content).toContainEqual({ type: 'text', text: 'OK' })
+  expect(requests).toHaveLength(1)
+  expect(requests[0]?.model).toBe('claude-fable-5-2')
+  expect(semver.gte(CLAUDE_CODE_COMPAT_VERSION, '2.1.290')).toBe(true)
+  expect(requestHeaders[0]?.get('user-agent')).toContain(
+    `claude-cli/${CLAUDE_CODE_COMPAT_VERSION} (external, cli`,
+  )
+  expect(JSON.stringify(requests[0]?.system)).toContain(
+    `cc_version=${CLAUDE_CODE_COMPAT_VERSION}.`,
+  )
+  expect(JSON.stringify(requests[0]?.system)).toContain('cc_entrypoint=cli;')
+  expect(requestHeaders[0]?.get('x-stainless-package-version')).toBe('0.128.0')
+}, 10_000)
 
 for (const disableAdaptive of [false, true]) {
   test(`Sonnet 5.5 never sends disabled thinking, with optional adaptive disabled=${disableAdaptive}`, async () => {
@@ -1133,6 +1178,7 @@ for (const [model, expectedThinking] of [
   ['claude-opus-5-5', { type: 'adaptive' }],
   ['claude-sonnet-5-5', { type: 'adaptive' }],
   ['claude-haiku-5-5', { type: 'adaptive' }],
+  ['claude-fable-5-2', { type: 'adaptive' }],
   ['claude-fable-5-1', { type: 'adaptive' }],
   ['claude-opus-5', { type: 'adaptive' }],
   ['claude-sonnet-5', { type: 'adaptive' }],

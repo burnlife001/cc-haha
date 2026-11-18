@@ -29,6 +29,8 @@ import { useTabStore } from './tabStore'
 import { releaseWorkspaceSession } from '../lib/workspace/releaseSession'
 import { useActivityPanelStore } from './activityPanelStore'
 import type { MessageEntry } from '../types/session'
+import type { RuntimeSelection } from '../types/runtime'
+import { teamRuntimeScope, useTeamRuntimeControlStore } from './teamRuntimeControlStore'
 
 const MEMBER_POLL_INTERVAL_MS = 1500
 const MEMBER_TRANSCRIPT_MATCH_WINDOW_MS = 120_000
@@ -178,6 +180,7 @@ function toTeamMember(raw: Record<string, unknown>): TeamMember {
     model: typeof raw.model === 'string' ? raw.model : undefined,
     providerId: raw.providerId === null || typeof raw.providerId === 'string' ? raw.providerId : undefined,
     providerName: typeof raw.providerName === 'string' ? raw.providerName : undefined,
+    effortLevel: typeof raw.effortLevel === 'string' ? raw.effortLevel : undefined,
   }
 }
 
@@ -316,6 +319,26 @@ function teamMatchesLifecycle(
   return true
 }
 
+/**
+ * Applies a member's new runtime to `team` only when it is the same incarnation
+ * as `target`, so the patch never lands on a later team that reuses the name.
+ */
+function withMemberRuntime(
+  team: TeamDetail,
+  target: TeamDetail,
+  agentId: string,
+  runtime: Pick<TeamMember, 'model' | 'providerId' | 'providerName' | 'effortLevel'>,
+): TeamDetail {
+  if (team.name !== target.name || teamIdentityKey(team) !== teamIdentityKey(target)) return team
+  if (!team.members.some((member) => member.agentId === agentId)) return team
+  return {
+    ...team,
+    members: team.members.map((member) => (
+      member.agentId === agentId ? { ...member, ...runtime } : member
+    )),
+  }
+}
+
 function teamIsDeleted(team: TeamDetail): boolean {
   return deletedTeamNames.has(team.name) || Boolean(
     team.incarnationId && deletedTeamIncarnations.has(team.incarnationId),
@@ -368,11 +391,12 @@ function appendWorkbenchSnapshot(
   snapshot: TeamWorkbenchSnapshot,
 ): TeamWorkbenchTimeline {
   if (timeline?.snapshots.at(-1)?.version === snapshot.version) {
-    return { ...timeline, loading: false, error: null }
+    return { ...timeline, source: 'live', loading: false, error: null }
   }
   const snapshots = [...(timeline?.snapshots ?? []), snapshot].slice(-WORKBENCH_HISTORY_LIMIT)
   return {
     teamName: snapshot.team.name,
+    source: 'live',
     snapshots,
     loading: false,
     error: null,
@@ -414,6 +438,13 @@ function teamForMemberSession(
 /** A member transcript stays worth polling while its shared run desktop is active. */
 function isMemberSessionWatched(memberTabId: string): boolean {
   return useTabStore.getState().activeTabId === memberTabId
+}
+
+// What the server delivers to a member's CLI as a command rather than a message.
+const MEMBER_COMMAND_SEND = /^\/[a-z0-9][\w:.-]*(?:\s|$)/i
+
+function isMemberCommandSend(content: string): boolean {
+  return MEMBER_COMMAND_SEND.test(content.trim())
 }
 
 function isPendingMemberMessage(message: UIMessage): message is Extract<UIMessage, { type: 'user_text' }> & { pending: true } {
@@ -778,7 +809,8 @@ function mergeDurableMemberMessage(durable: UIMessage, live: UIMessage): UIMessa
     return { ...durable, ...live }
   }
   if (durable.type === 'tool_result' && live.type === 'tool_result') {
-    return { ...durable, ...live }
+    const durationMs = durable.durationMs ?? live.durationMs
+    return { ...durable, ...live, ...(durationMs !== undefined ? { durationMs } : {}) }
   }
   if (durable.type === 'thinking' && live.type === 'thinking') return live
   return durable
@@ -882,7 +914,11 @@ function syncMemberSessionMessages(
       // A failure recorded after the message went out ends the wait: the turn
       // that would have answered it is over.
       const failedSince = failure !== undefined && failure !== reply.failureAtSend
-      if (!settlement.settled && !failedSince) unsettledReplies.push(reply)
+      // A command runs in the member's own CLI and often answers with no reply
+      // at all (/compact records only its summary). Once the transcript shows
+      // it ran, the member's own activity says whether it is still busy.
+      const commandRan = settlement.promptKey !== undefined && isMemberCommandSend(reply.content)
+      if (!settlement.settled && !commandRan && !failedSince) unsettledReplies.push(reply)
     })
   }
   if (unsettledReplies.length === 0) {
@@ -1072,6 +1108,8 @@ type TeamStore = {
     snapshot?: TeamWorkbenchSnapshot,
   ) => void
   sendMessageToMember: (sessionId: string, content: string) => Promise<void>
+  /** Switches a member's model through the team runtime; rejects with the server's error. */
+  updateMemberRuntime: (sessionId: string, selection: RuntimeSelection) => Promise<void>
   startMemberPolling: (sessionId: string, force?: boolean) => void
   stopMemberPolling: () => void
   clearTeam: () => void
@@ -1285,6 +1323,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
           ...state.workbenchesBySession,
           [sessionId]: {
             teamName: timeline.teamName,
+            source: timeline.source,
             snapshots,
             loading: false,
             error: null,
@@ -1475,6 +1514,11 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
           // Structured tool output drives the richer result renderers; omitting
           // it here flattened every member tool call back to plain text.
           toolUseResult: msg.toolUseResult,
+          ...(typeof msg.durationMs === 'number' &&
+          Number.isFinite(msg.durationMs) &&
+          msg.durationMs >= 0
+            ? { durationMs: msg.durationMs }
+            : {}),
         }))
         const existingMessages = useChatStore.getState().sessions[sessionId]?.messages ?? []
         const hasIncrementalMetadata = typeof response.signature === 'string' &&
@@ -1754,6 +1798,48 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
     }
   },
 
+  updateMemberRuntime: async (sessionId, selection) => {
+    const team = get().getTeamByMemberSessionId(sessionId)
+    const member = get().getMemberBySessionId(sessionId)
+    const scope = teamRuntimeScope(team)
+    if (!team || !member?.sessionId || !scope) {
+      throw new Error('Team member session is no longer available')
+    }
+    const { member: updated } = await useTeamRuntimeControlStore.getState().saveMember(scope, member.agentId, member.sessionId, selection)
+    // The picker shows the member's own entry; patch it now rather than leave
+    // the old model on screen until the next workbench read lands.
+    const runtime = {
+      model: updated?.model ?? selection.modelId,
+      providerId: updated?.providerId !== undefined ? updated.providerId : selection.providerId,
+      providerName: updated?.providerName ?? member.providerName,
+      effortLevel: selection.effortLevel,
+    }
+    set((state) => ({
+      activeTeam: state.activeTeam
+        ? withMemberRuntime(state.activeTeam, team, member.agentId, runtime)
+        : state.activeTeam,
+      memberTeamBySession: Object.fromEntries(
+        Object.entries(state.memberTeamBySession).map(([memberSessionId, memberTeam]) => [
+          memberSessionId,
+          memberTeam ? withMemberRuntime(memberTeam, team, member.agentId, runtime) : memberTeam,
+        ]),
+      ),
+      workbenchesBySession: Object.fromEntries(
+        Object.entries(state.workbenchesBySession).map(([leadSessionId, timeline]) => {
+          const latest = timeline?.snapshots.at(-1)
+          if (!timeline || !latest) return [leadSessionId, timeline]
+          const patched = withMemberRuntime(latest.team, team, member.agentId, runtime)
+          if (patched === latest.team) return [leadSessionId, timeline]
+          return [leadSessionId, {
+            ...timeline,
+            snapshots: [...timeline.snapshots.slice(0, -1), { ...latest, team: patched }],
+          }]
+        }),
+      ),
+    }))
+    void get().fetchWorkbench(team.name)
+  },
+
   startMemberPolling: (sessionId, force = false) => {
     const member = get().getMemberBySessionId(sessionId)
     if (!member) return
@@ -1785,6 +1871,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
 
   clearTeam: () => {
     teamStoreGeneration += 1
+    useTeamRuntimeControlStore.getState().clear()
     get().stopMemberPolling()
     clearMemberSessionState(new Set([
       ...Object.keys(get().memberTeamBySession),

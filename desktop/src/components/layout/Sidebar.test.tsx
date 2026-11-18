@@ -11,12 +11,15 @@ import { Profiler, useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import '@testing-library/jest-dom'
+import { resolveAppRegion } from '../../test/appRegion'
 import type {
   DesktopUiPreferencesResponse,
   SidebarProjectPreferences,
 } from '../../api/desktopUiPreferences'
 
 const desktopUiPreferencesApiMock = vi.hoisted(() => ({
+  getProjectDirectories: vi.fn(),
+  updateProjectDirectories: vi.fn(),
   updateSidebarPreferences: vi.fn(),
   updateProjectDisplayName: vi.fn(),
 }))
@@ -176,7 +179,7 @@ vi.mock('./ProjectEditorModal', () => ({
     error?: string | null
     onClose: () => void
     onSourceFolderChange?: (path: string) => void
-    onSubmit: (submission: { name: string; sourceFolder: string; logicalRoot: string }) => void | Promise<void>
+    onSubmit: (submission: { name: string; sourceFolder: string; logicalRoot: string; additionalDirectories: string[] }) => void | Promise<void>
     onRestoreFolderName?: () => void | Promise<void>
     onRemoveFromSidebar?: () => void | Promise<void>
   }) => {
@@ -208,7 +211,7 @@ vi.mock('./ProjectEditorModal', () => ({
         )}
         <button
           type="button"
-          onClick={() => void props.onSubmit({ name, sourceFolder, logicalRoot })}
+          onClick={() => void props.onSubmit({ name, sourceFolder, logicalRoot, additionalDirectories: [] })}
         >
           Submit {props.mode} project
         </button>
@@ -219,6 +222,7 @@ vi.mock('./ProjectEditorModal', () => ({
               name: props.suggestedName!.trim().replace(/\s+/g, ' '),
               sourceFolder,
               logicalRoot,
+              additionalDirectories: [],
             })}
           >
             Submit folder project name
@@ -422,6 +426,7 @@ describe('Sidebar', () => {
   const deleteSession = vi.fn()
   const deleteSessions = vi.fn()
   const setSessionArchived = vi.fn()
+  const setSessionsArchived = vi.fn()
   const addToast = vi.fn()
 
   beforeEach(() => {
@@ -432,8 +437,14 @@ describe('Sidebar', () => {
     deleteSession.mockReset()
     deleteSessions.mockReset()
     setSessionArchived.mockReset()
+    setSessionsArchived.mockReset()
+    setSessionsArchived.mockResolvedValue({ successes: [], failures: [] })
     addToast.mockReset()
     desktopUiPreferencesApiMock.updateSidebarPreferences.mockReset()
+    desktopUiPreferencesApiMock.getProjectDirectories.mockReset()
+    desktopUiPreferencesApiMock.updateProjectDirectories.mockReset()
+    desktopUiPreferencesApiMock.getProjectDirectories.mockImplementation(async (workDir: string) => ({ projectKey: workDir, mainDirectory: workDir, additionalDirectories: [] }))
+    desktopUiPreferencesApiMock.updateProjectDirectories.mockImplementation(async (workDir: string, additionalDirectories: string[]) => ({ ok: true, projectKey: workDir, mainDirectory: workDir, additionalDirectories }))
     desktopUiPreferencesApiMock.updateProjectDisplayName.mockReset()
     desktopUiPreferencesApiMock.updateProjectDisplayName.mockImplementation((projectKey: string, displayName: string | null) => Promise.resolve({
       ok: true,
@@ -499,6 +510,7 @@ describe('Sidebar', () => {
       deleteSession,
       deleteSessions,
       setSessionArchived,
+      setSessionsArchived,
     })
     useChatStore.setState({
       connectToSession,
@@ -526,29 +538,118 @@ describe('Sidebar', () => {
     window.localStorage.removeItem(PROJECT_SORT_STORAGE_KEY)
   })
 
-  it('hides archived rows but keeps an archive-only project discoverable after reload', async () => {
-    useSessionStore.setState({
-      sessions: [{ ...makeSession('archived-1', 'Archived conversation', '/workspace/alpha', '2026-01-01'), archived: true }],
-      projectArchivedTotals: { '/workspace/alpha': 1 },
-    })
+  it('keeps an archive-only project as a quiet row and browses its archive in place of the list', async () => {
+    const archived = { ...makeSession('archived-1', 'Archived conversation', '/workspace/alpha', '2026-01-01'), archived: true }
+    useSessionStore.setState({ sessions: [archived], projectArchivedTotals: { '/workspace/alpha': 1 } })
+    sessionsApiMock.listProjectHistory.mockResolvedValue({ sessions: [archived], nextCursor: null })
     render(<Sidebar />)
-    expect(screen.queryByText('Archived conversation')).not.toBeInTheDocument()
+
+    const group = screen.getByTestId('sidebar-project-group-workspace-alpha')
+    expect(within(group).queryByText('Archived conversation')).not.toBeInTheDocument()
+    expect(within(group).getByText('sidebar.projectAllArchived')).toBeInTheDocument()
+    expect(screen.queryByTestId('sidebar-project-count-workspace-alpha')).not.toBeInTheDocument()
+    expect(within(group).queryByRole('button', { name: /sidebar\.archivedSessions/ })).not.toBeInTheDocument()
+
     fireEvent.click(screen.getByRole('button', { name: 'Project actions for alpha' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'sidebar.archivedSessions' }))
-    await waitFor(() => expect(sessionsApiMock.listProjectHistory).toHaveBeenCalledWith(
+
+    const view = screen.getByTestId('sidebar-archive-view')
+    expect(await within(view).findByText('Archived conversation')).toBeInTheDocument()
+    expect(sessionsApiMock.listProjectHistory).toHaveBeenCalledWith(
       expect.objectContaining({ projectRoot: '/workspace/alpha', archived: true }), expect.anything(),
-    ))
-    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    )
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('sidebar-projects-header')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('sidebar-project-group-workspace-alpha')).not.toBeInTheDocument()
+
+    fireEvent.click(within(view).getByRole('button', { name: 'sidebar.archiveBack' }))
+    expect(screen.queryByTestId('sidebar-archive-view')).not.toBeInTheDocument()
+    expect(screen.getByTestId('sidebar-projects-header')).toBeInTheDocument()
+    expect(screen.getByTestId('sidebar-project-group-workspace-alpha')).toBeInTheDocument()
   })
 
-  it('archives through the session menu and leaves a rejected session usable', async () => {
+  it('offers no group selection for an archive-only project in batch mode', () => {
+    useSessionStore.setState({
+      sessions: [makeSession('live-1', 'Live session', '/workspace/beta', '2026-01-02')],
+      projectArchivedTotals: { '/workspace/alpha': 2 },
+      isBatchMode: true,
+    })
+    render(<Sidebar />)
+
+    expect(screen.getByRole('button', { name: 'Select beta' })).toHaveTextContent('Select all')
+    expect(screen.queryByRole('button', { name: 'Select alpha' })).not.toBeInTheDocument()
+    expect(within(screen.getByTestId('sidebar-project-group-workspace-alpha')).getByText('sidebar.projectAllArchived')).toBeInTheDocument()
+  })
+
+  it('does not put an archive entry inside a project that still has sessions', () => {
+    useSessionStore.setState({
+      sessions: [makeSession('live-1', 'Live session', '/workspace/alpha', '2026-01-02')],
+      projectSessionTotals: { '/workspace/alpha': 1 },
+      projectArchivedTotals: { '/workspace/alpha': 5 },
+    })
+    render(<Sidebar />)
+
+    const group = screen.getByTestId('sidebar-project-group-workspace-alpha')
+    expect(within(group).getByText('Live session')).toBeInTheDocument()
+    expect(within(group).queryByText(/sidebar\.archivedSessions/)).not.toBeInTheDocument()
+    expect(within(group).queryByText('sidebar.projectAllArchived')).not.toBeInTheDocument()
+    expect(screen.getByTestId('sidebar-project-count-workspace-alpha')).toHaveTextContent('1')
+  })
+
+  it('opens every archived session from the projects menu and leaves batch mode first', async () => {
+    useSessionStore.setState({
+      sessions: [makeSession('live-1', 'Live session', '/workspace/alpha', '2026-01-02')],
+      isBatchMode: true,
+    })
+    sessionsApiMock.list.mockResolvedValue({ sessions: [], total: 0 })
+    render(<Sidebar />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Project menu' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'sidebar.archivedSessions' }))
+
+    const view = screen.getByTestId('sidebar-archive-view')
+    expect(within(view).getByText('sidebar.archivedSessions')).toBeInTheDocument()
+    await waitFor(() => expect(sessionsApiMock.list).toHaveBeenCalledWith(
+      expect.objectContaining({ archived: true, offset: 0 }), expect.anything(),
+    ))
+    expect(useSessionStore.getState().isBatchMode).toBe(false)
+    expect(screen.queryByRole('button', { name: 'Cancel batch mode' })).not.toBeInTheDocument()
+  })
+
+  it('archives from the session menu and offers one undo', async () => {
+    useSessionStore.setState({ sessions: [makeSession('archive-target', 'Archive target', '/workspace/alpha', '2026-01-01')] })
+    setSessionArchived.mockResolvedValueOnce(undefined)
+    render(<Sidebar />)
+    fireEvent.contextMenu(screen.getByText('Archive target'))
+    const menu = screen.getByRole('menu')
+    expect(within(menu).getAllByRole('menuitem').map((item) => item.textContent)).toEqual([
+      'Rename', 'sidebar.archiveSession', 'Delete',
+    ])
+    expect(within(menu).getByRole('separator')).toBeInTheDocument()
+
+    fireEvent.click(within(menu).getByRole('menuitem', { name: 'sidebar.archiveSession' }))
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'success',
+      message: 'sidebar.archivedToast',
+      action: expect.objectContaining({ label: 'common.undo' }),
+    })))
+    expect(setSessionArchived).toHaveBeenCalledWith('archive-target', true)
+    expect(setSessionsArchived).not.toHaveBeenCalled()
+
+    await act(async () => addToast.mock.calls[0]![0].action.onClick())
+    expect(setSessionsArchived).toHaveBeenCalledWith(['archive-target'], false)
+  })
+
+  it('leaves a rejected session usable and without an undo', async () => {
     useSessionStore.setState({ sessions: [makeSession('archive-target', 'Archive target', '/workspace/alpha', '2026-01-01')] })
     setSessionArchived.mockRejectedValueOnce(new Error('fixture write failure'))
     render(<Sidebar />)
     fireEvent.contextMenu(screen.getByText('Archive target'))
-    fireEvent.click(screen.getByRole('button', { name: 'sidebar.archiveSession' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'sidebar.archiveSession' }))
     await waitFor(() => expect(setSessionArchived).toHaveBeenCalledWith('archive-target', true))
-    await waitFor(() => expect(addToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' })))
+    await waitFor(() => expect(addToast).toHaveBeenCalledWith({ type: 'error', message: 'sidebar.archiveFailed' }))
+    expect(addToast).toHaveBeenCalledTimes(1)
     expect(screen.getByText('Archive target')).toBeInTheDocument()
     expect(disconnectSession).not.toHaveBeenCalled()
     expect(deleteSession).not.toHaveBeenCalled()
@@ -559,7 +660,37 @@ describe('Sidebar', () => {
     useChatStore.setState({ sessions: { 'archive-waiting': makeChatSessionState(openRequest) } })
     render(<Sidebar />)
     fireEvent.contextMenu(screen.getByText('Waiting session'))
-    expect(screen.getByRole('button', { name: 'sidebar.archiveSession' })).toBeDisabled()
+    const archive = screen.getByRole('menuitem', { name: 'sidebar.archiveSession' })
+    expect(archive).toBeDisabled()
+    expect(archive).toHaveAttribute('title', 'sidebar.archiveBusy')
+  })
+
+  it('archives the batch selection, skips busy sessions, and undoes the archived ones together', async () => {
+    useSessionStore.setState({
+      sessions: [
+        makeSession('batch-1', 'First batch session', '/workspace/alpha', '2026-01-03'),
+        makeSession('batch-2', 'Second batch session', '/workspace/alpha', '2026-01-02'),
+        makeSession('batch-waiting', 'Waiting batch session', '/workspace/alpha', '2026-01-01'),
+      ],
+    })
+    useChatStore.setState({ sessions: { 'batch-waiting': makeChatSessionState(openRequest) } })
+    setSessionsArchived.mockResolvedValueOnce({ successes: ['batch-1', 'batch-2'], failures: [] })
+    render(<Sidebar />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Batch manage' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Select all' }))
+    expect(screen.getByText('3 selected')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'sidebar.batchArchiveSelected' }))
+
+    await waitFor(() => expect(setSessionsArchived).toHaveBeenCalledWith(['batch-1', 'batch-2'], true))
+    await waitFor(() => expect(addToast).toHaveBeenCalledWith({ type: 'error', message: 'sidebar.batchArchiveFailed' }))
+    const success = addToast.mock.calls.find(([toast]) => toast.type === 'success')![0]
+    expect(success).toMatchObject({ message: 'sidebar.batchArchiveSucceeded', action: { label: 'common.undo' } })
+    // A refused session stays selected, so batch mode stays open for it.
+    expect(useSessionStore.getState().isBatchMode).toBe(true)
+
+    await act(async () => success.action.onClick())
+    expect(setSessionsArchived).toHaveBeenLastCalledWith(['batch-1', 'batch-2'], false)
   })
 
   it('opens an editable draft without allocating a session from the sidebar', async () => {
@@ -581,6 +712,25 @@ describe('Sidebar', () => {
     expect(useTabStore.getState().activeTabId).toBeNull()
     expect(screen.getByRole('complementary')).not.toHaveAttribute('data-desktop-drag-region')
     expect(screen.getByTestId('sidebar-title-region')).toHaveAttribute('data-desktop-drag-region')
+  })
+
+  it('keeps every control in the title region clickable on the drag region', async () => {
+    // Only controls inside a drag region are no-drag now, so the rule has to
+    // name every kind the titlebars hold — the repository link here is an <a>,
+    // not a button, and dropping `a` from the rule would let a press on it
+    // drag the window instead.
+    const root = document.body.appendChild(document.createElement('div'))
+    root.id = 'root'
+    render(<Sidebar />, { container: root })
+
+    const titleRegion = screen.getByTestId('sidebar-title-region')
+    expect(resolveAppRegion(titleRegion)).toBe('drag')
+    const controls = Array.from(titleRegion.querySelectorAll('a, button'))
+    expect(controls.some((control) => control.tagName === 'A')).toBe(true)
+    expect(controls.some((control) => control.tagName === 'BUTTON')).toBe(true)
+    for (const control of controls) {
+      expect(resolveAppRegion(control), control.outerHTML).toBe('no-drag')
+    }
   })
 
   it('answers the Cmd+N request like the New Session item, in the project on screen', async () => {
@@ -1278,69 +1428,46 @@ describe('Sidebar', () => {
     await waitFor(() => expect(useUIStore.getState().newSessionDraft?.workDir).toBe('/workspace/alpha'))
   })
 
-  it('creates a named project at its resolved root while launching the selected source folder', async () => {
+  it('creates a nested project at its selected root without renaming the parent repository', async () => {
     repositoryContextMock.mockResolvedValue({ repoRoot: '/workspace/repository' })
     createSession.mockResolvedValue('created-project-session')
 
     render(<Sidebar />)
-
     fireEvent.click(screen.getByRole('button', { name: 'New project' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Use existing folder' }))
-
-    const editor = screen.getByTestId('project-editor-modal')
-    expect(editor).toHaveAttribute('data-source-folder', '')
     fireEvent.click(screen.getByRole('button', { name: 'Choose project source' }))
 
-    await waitFor(() => expect(repositoryContextMock).toHaveBeenCalledWith('/workspace/repository/packages/app'))
-    await waitFor(() => {
-      expect(editor).toHaveAttribute('data-source-folder', '/workspace/repository/packages/app')
-      expect(editor).toHaveAttribute('data-logical-root', '/workspace/repository')
-      expect(editor).toHaveAttribute('data-suggested-name', 'repository')
-    })
-
+    const editor = screen.getByTestId('project-editor-modal')
+    expect(editor).toHaveAttribute('data-logical-root', '/workspace/repository/packages/app')
+    expect(editor).toHaveAttribute('data-suggested-name', 'app')
     fireEvent.click(screen.getByRole('button', { name: 'Submit create project' }))
+
     await waitFor(() => {
+      expect(desktopUiPreferencesApiMock.updateProjectDirectories).toHaveBeenCalledWith(
+        '/workspace/repository/packages/app', [], { createProject: true },
+      )
       expect(desktopUiPreferencesApiMock.updateProjectDisplayName).toHaveBeenCalledWith(
-        '/workspace/repository',
-        'Created project',
+        '/workspace/repository/packages/app', 'Created project',
       )
       expect(createSession).toHaveBeenCalledWith('/workspace/repository/packages/app')
       expect(connectToSession).toHaveBeenCalledWith('created-project-session')
     })
-    expect(createSession.mock.invocationCallOrder[0]).toBeLessThan(
-      desktopUiPreferencesApiMock.updateProjectDisplayName.mock.invocationCallOrder[0]!,
+    expect(desktopUiPreferencesApiMock.updateProjectDirectories.mock.invocationCallOrder[0]).toBeLessThan(
+      createSession.mock.invocationCallOrder[0]!,
     )
-    expect(repositoryContextMock).toHaveBeenCalledTimes(1)
+    expect(repositoryContextMock).not.toHaveBeenCalled()
   })
 
-  it('opens the session before repository context resolves and falls back after lookup failure', async () => {
-    const repositoryContext = createDeferred<{ repoRoot: string | null; workDir?: string }>()
-    repositoryContextMock.mockReturnValueOnce(repositoryContext.promise)
+  it('keeps a hidden parent hidden when creating an independent child project', async () => {
+    window.localStorage.setItem(PROJECT_HIDDEN_STORAGE_KEY, JSON.stringify(['/workspace/repository']))
     createSession.mockResolvedValue('created-project-session')
-
     render(<Sidebar />)
-
     fireEvent.click(screen.getByRole('button', { name: 'New project' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Use existing folder' }))
     fireEvent.click(screen.getByRole('button', { name: 'Choose project source' }))
     fireEvent.click(screen.getByRole('button', { name: 'Submit create project' }))
-
-    await waitFor(() => {
-      expect(createSession).toHaveBeenCalledWith('/workspace/repository/packages/app')
-      expect(connectToSession).toHaveBeenCalledWith('created-project-session')
-      expect(screen.queryByTestId('project-editor-modal')).not.toBeInTheDocument()
-    })
-    expect(desktopUiPreferencesApiMock.updateProjectDisplayName).not.toHaveBeenCalled()
-
-    await act(async () => {
-      repositoryContext.reject(new Error('repository context unavailable'))
-      await repositoryContext.promise.catch(() => undefined)
-    })
-
-    await waitFor(() => expect(desktopUiPreferencesApiMock.updateProjectDisplayName).toHaveBeenCalledWith(
-      '/workspace/repository/packages/app',
-      'Created project',
-    ))
+    await waitFor(() => expect(connectToSession).toHaveBeenCalledWith('created-project-session'))
+    expect(JSON.parse(window.localStorage.getItem(PROJECT_HIDDEN_STORAGE_KEY)!)).toEqual(['/workspace/repository'])
   })
 
   it('resets instead of persisting a redundant alias when creating with the folder name', async () => {
@@ -1357,7 +1484,7 @@ describe('Sidebar', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Choose project source' }))
     await waitFor(() => expect(screen.getByTestId('project-editor-modal')).toHaveAttribute(
       'data-suggested-name',
-      'repository',
+      'app',
     ))
     fireEvent.click(screen.getByRole('button', { name: 'Submit folder project name' }))
 
@@ -1366,7 +1493,7 @@ describe('Sidebar', () => {
       expect(screen.queryByTestId('project-editor-modal')).not.toBeInTheDocument()
     })
     expect(desktopUiPreferencesApiMock.updateProjectDisplayName).toHaveBeenCalledWith(
-      '/workspace/repository',
+      '/workspace/repository/packages/app',
       null,
     )
   })
@@ -1388,7 +1515,6 @@ describe('Sidebar', () => {
     fireEvent.click(screen.getByRole('button', { name: 'New project' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Use existing folder' }))
     fireEvent.click(screen.getByRole('button', { name: 'Choose project source' }))
-    await waitFor(() => expect(repositoryContextMock).toHaveBeenCalled())
     fireEvent.click(screen.getByRole('button', { name: 'Submit create project' }))
 
     await waitFor(() => {
@@ -1423,7 +1549,6 @@ describe('Sidebar', () => {
     fireEvent.click(screen.getByRole('button', { name: 'New project' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Use existing folder' }))
     fireEvent.click(screen.getByRole('button', { name: 'Choose project source' }))
-    await waitFor(() => expect(repositoryContextMock).toHaveBeenCalled())
     fireEvent.click(screen.getByRole('button', { name: 'Submit create project' }))
 
     await waitFor(() => {
@@ -1434,69 +1559,36 @@ describe('Sidebar', () => {
     expect(connectToSession).not.toHaveBeenCalled()
   })
 
-  it('uses the resolved non-git workDir as the project display-name key', async () => {
-    repositoryContextMock.mockResolvedValue({
-      repoRoot: null,
-      workDir: '/real/workspace/project',
+  it('uses the server-validated project identity for the display name', async () => {
+    desktopUiPreferencesApiMock.updateProjectDirectories.mockResolvedValueOnce({
+      ok: true, projectKey: '/real/workspace/project', mainDirectory: '/real/workspace/project', additionalDirectories: [],
     })
     createSession.mockResolvedValue('created-project-session')
-
     render(<Sidebar />)
-
     fireEvent.click(screen.getByRole('button', { name: 'New project' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Use existing folder' }))
     fireEvent.click(screen.getByRole('button', { name: 'Choose project source' }))
-
-    await waitFor(() => {
-      const editor = screen.getByTestId('project-editor-modal')
-      expect(editor).toHaveAttribute('data-source-folder', '/workspace/repository/packages/app')
-      expect(editor).toHaveAttribute('data-logical-root', '/real/workspace/project')
-      expect(editor).toHaveAttribute('data-suggested-name', 'project')
-    })
-
     fireEvent.click(screen.getByRole('button', { name: 'Submit create project' }))
+
     await waitFor(() => {
       expect(desktopUiPreferencesApiMock.updateProjectDisplayName).toHaveBeenCalledWith(
-        '/real/workspace/project',
-        'Created project',
+        '/real/workspace/project', 'Created project',
       )
       expect(createSession).toHaveBeenCalledWith('/workspace/repository/packages/app')
     })
   })
 
-  it('keeps the latest logical root when an earlier lookup finishes late', async () => {
-    let resolveFirstLookup: (value: { repoRoot: string | null }) => void = () => undefined
-    const firstLookup = new Promise<{ repoRoot: string | null }>((resolve) => {
-      resolveFirstLookup = resolve
-    })
-    repositoryContextMock
-      .mockImplementationOnce(() => firstLookup)
-      .mockResolvedValueOnce({ repoRoot: '/workspace/other' })
-
+  it('keeps the latest selected folder as its independent project root', () => {
     render(<Sidebar />)
-
     fireEvent.click(screen.getByRole('button', { name: 'New project' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Use existing folder' }))
     fireEvent.click(screen.getByRole('button', { name: 'Choose project source' }))
     fireEvent.click(screen.getByRole('button', { name: 'Choose other project source' }))
-
-    await waitFor(() => expect(repositoryContextMock).toHaveBeenNthCalledWith(2, '/workspace/other'))
-    await waitFor(() => {
-      const editor = screen.getByTestId('project-editor-modal')
-      expect(editor).toHaveAttribute('data-source-folder', '/workspace/other')
-      expect(editor).toHaveAttribute('data-logical-root', '/workspace/other')
-      expect(editor).toHaveAttribute('data-suggested-name', 'other')
-    })
-
-    await act(async () => {
-      resolveFirstLookup({ repoRoot: '/workspace/repository' })
-      await Promise.resolve()
-    })
-
     const editor = screen.getByTestId('project-editor-modal')
     expect(editor).toHaveAttribute('data-source-folder', '/workspace/other')
     expect(editor).toHaveAttribute('data-logical-root', '/workspace/other')
     expect(editor).toHaveAttribute('data-suggested-name', 'other')
+    expect(repositoryContextMock).not.toHaveBeenCalled()
   })
 
   it('edits, resets, and removes a project without changing its real path or sessions', async () => {
@@ -2271,7 +2363,7 @@ describe('Sidebar', () => {
 
     fireEvent.contextMenu(screen.getByRole('button', { name: /Open Session/ }))
 
-    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
 
     expect(deleteSession).not.toHaveBeenCalled()
     const dialog = screen.getByRole('dialog')

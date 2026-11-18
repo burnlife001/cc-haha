@@ -3,7 +3,7 @@ import { Linking, Platform, ScrollView, View } from 'react-native'
 import { router } from 'expo-router'
 import Constants from 'expo-constants'
 import { isH5 } from '../state/h5'
-import { useApp, useConnection } from '../state/AppContext'
+import { pushTokens, useApp, useConnection } from '../state/AppContext'
 import { usePushRegistration, useRetryPushRegistration } from '../state/PushRegistrationContext'
 import { usePreferences } from '../state/PreferencesContext'
 import {
@@ -34,25 +34,28 @@ import {
   requestNotificationStatus,
   scheduleTestNotification,
 } from '../core/systemPermissions'
-import { getDevicePushToken } from '../state/devicePushToken'
 import { DeliveryCard } from '../ui/settings/DeliveryCard'
 import { ProfileEntry } from '../ui/profile/ProfileEntry'
 import { QuietHoursSheet } from '../ui/settings/QuietHoursSheet'
 import { useSystemPermissions } from '../ui/settings/useSystemPermissions'
+import { requestBackgroundRunning, useDutyStatus } from '../ui/settings/useDutyStatus'
 import {
   aboutLinks,
   channelFootnote,
   channelRows,
   computerSettingsTitle,
   computersValue,
-  deliveryNote,
+  createPushTestFeedback,
+  deliveryCardNote,
   deliveryStatus,
   liveActivityValue,
   permissionLabel,
+  reconcilePushTestFeedback,
   remindFootnote,
   runTestNotification,
   versionLabel,
   type Delivery,
+  type PushTestFeedback,
   type PushTestResult,
 } from '../ui/settings/deliveryModel'
 import { quietSummary } from '../ui/settings/settingsModel'
@@ -76,13 +79,27 @@ export default function Settings() {
   const retryPush = useRetryPushRegistration(host?.id)
   const permissions = useSystemPermissions()
   const [busy, setBusy] = useState<Delivery['actions'][number]['kind'] | null>(null)
-  const [deliveryError, setDeliveryError] = useState('')
-  const [testNote, setTestNote] = useState('')
+  const [deliveryFailure, setDeliveryFailure] = useState<{
+    hostId: string | undefined
+    message: string
+  } | null>(null)
+  const [testFeedback, setTestFeedback] = useState<PushTestFeedback | null>(null)
   const [notifyError, setNotifyError] = useState('')
   const [appearanceError, setAppearanceError] = useState('')
   const [linkError, setLinkError] = useState('')
   const [quietOpen, setQuietOpen] = useState(0)
   const [quietVisible, setQuietVisible] = useState(false)
+  const { decisions, completed, errors } = preferences.notifications
+  // Only when this computer reaches the phone through the background connection.
+  const duty = useDutyStatus(
+    push?.status === 'registered' && push.provider === 'desktop' &&
+      (decisions || completed || errors)
+  )
+
+  const reconciledFeedback = reconcilePushTestFeedback(testFeedback, push, host?.id)
+  if (reconciledFeedback !== testFeedback) setTestFeedback(reconciledFeedback)
+  const deliveryError =
+    deliveryFailure && deliveryFailure.hostId === host?.id ? deliveryFailure.message : ''
 
   const delivery = deliveryStatus({
     platform,
@@ -92,8 +109,9 @@ export default function Settings() {
     hasHost: Boolean(host),
     decisions: preferences.notifications.decisions,
     liveActivity: preferences.liveActivity,
+    duty,
   })
-  const note = deliveryNote(push)
+  const note = deliveryCardNote(reconciledFeedback, push, duty, host?.id)
   const remind = remindFootnote(permissions.notifications)
 
   /** 向系统申请通知权限；申请过就记下，不再自动弹引导页。 */
@@ -107,26 +125,37 @@ export default function Settings() {
   }
 
   async function runAction(kind: Delivery['actions'][number]['kind']) {
-    setDeliveryError('')
-    setTestNote('')
+    const actionHostId = host?.id
+    const actionPush = push
+    setDeliveryFailure(null)
+    setTestFeedback(null)
     setBusy(kind)
     try {
       if (kind === 'request') await requestNotifications()
       else if (kind === 'settings') await openNotificationSettings()
       else if (kind === 'retry') retryPush()
+      else if (kind === 'battery') requestBackgroundRunning()
+      else if (kind === 'appSettings') await openAppSettings()
       else {
         if (host && !client) throw new Error('电脑还没连上，稍后再试')
         const outcome = await runTestNotification({
-          hostId: host?.id,
-          getToken: getDevicePushToken,
+          hostId: actionHostId,
+          push: actionPush,
+          // The test must reach the phone the same way the computer's real alerts do.
+          getToken: () => pushTokens.token(actionPush?.provider ?? 'direct', actionHostId ?? ''),
           postTest: (body) =>
             client!.post<PushTestResult>('/api/sessions/mobile-push/test', body),
           scheduleLocal: scheduleTestNotification,
         })
-        setTestNote(outcome.note)
+        setTestFeedback(createPushTestFeedback(outcome, actionHostId, actionPush))
+        // The computer just sent through its relay: read the fresh delivery state.
+        if (outcome.via === 'remote') retryPush()
       }
     } catch (e) {
-      setDeliveryError(kind === 'test' ? '测试未完成，请检查电脑连接后重试。' : errorText(e))
+      setDeliveryFailure({
+        hostId: actionHostId,
+        message: kind === 'test' ? '测试未完成，请检查电脑连接后重试。' : errorText(e),
+      })
     } finally {
       setBusy(null)
     }
@@ -186,7 +215,7 @@ export default function Settings() {
             <DeliveryCard
               delivery={delivery}
               busy={busy ?? (push?.status === 'loading' ? 'retry' : null)}
-              note={testNote || note}
+              note={note}
               error={deliveryError}
               onAction={(kind) => void runAction(kind)}
               onGuide={() => void open(aboutLinks.pushSetup)}

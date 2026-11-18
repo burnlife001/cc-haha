@@ -188,12 +188,17 @@ import {
   transitionPermissionMode,
 } from 'src/utils/permissions/permissionSetup.js'
 import {
-  tryGenerateSuggestion,
+  isUserStartedCommand,
   logSuggestionOutcome,
-  logSuggestionSuppressed,
-  type PromptVariant,
 } from 'src/services/PromptSuggestion/promptSuggestion.js'
-import { getLastCacheSafeParams } from 'src/utils/forkedAgent.js'
+import {
+  createSdkSuggestionState,
+  setSdkPromptSuggestions,
+  startSdkPushSuggestion,
+  takeOwedSdkSuggestionContext,
+  takeSdkSuggestionContext,
+} from 'src/services/PromptSuggestion/sdkPushSuggestion.js'
+import { getLastCacheSafeParams, type CacheSafeParams } from 'src/utils/forkedAgent.js'
 import {
   isLocalAgentTask,
   queuePendingMessage,
@@ -263,11 +268,12 @@ import {
 import { disableStaleMcpReconnect } from './mcpReconnectState.js'
 import {
   computerUsePermissionContext,
+  computerUseUnavailableMessage,
   createComputerUseMcpRefresh,
-  isComputerUseRuntimeTool,
   readComputerUseRefreshConfiguration,
 } from './computerUseMcpRefresh.js'
-import { COMPUTER_USE_MCP_SERVER_NAME, isComputerUseMCPServer } from '../utils/computerUse/common.js'
+import { COMPUTER_USE_MCP_SERVER_NAME, isComputerUseMCPServer, isComputerUseRuntimeTool } from '../utils/computerUse/common.js'
+import { requiresComputerUse } from '../utils/computerUse/turnIntent.js'
 import { getMcpPrefix } from 'src/services/mcp/mcpStringUtils.js'
 import {
   commandBelongsToServer,
@@ -286,7 +292,7 @@ import {
 } from 'src/utils/messages/mappers.js'
 import { createModelSwitchBreadcrumbs, createUserMessage } from 'src/utils/messages.js'
 import { PrintPartialOutputTracker } from './partialOutput.js'
-import { collectContextData } from 'src/commands/context/context-noninteractive.js'
+import { collectContextData, collectContextSummary } from 'src/commands/context/context-noninteractive.js'
 import { getSessionUsageSnapshot } from 'src/cost-tracker.js'
 import { LOCAL_COMMAND_STDOUT_TAG } from 'src/constants/xml.js'
 import {
@@ -335,6 +341,7 @@ import {
 import {
   restoreAgentFromSession,
   restoreSessionStateFromLog,
+  restoreWorktreeForResume,
 } from 'src/utils/sessionRestore.js'
 import { SandboxManager } from 'src/utils/sandbox/sandbox-adapter.js'
 import {
@@ -371,6 +378,7 @@ import { formatTeamFinishedPrompt, SHUTDOWN_TEAM_PROMPT } from '../utils/swarm/t
 import {
   readUnreadMessages,
   claimMailboxMessages,
+  returnClaimedMailboxMessages,
   formatTeammateMessages,
   isShutdownApproved,
   type TeammateMessage,
@@ -382,7 +390,7 @@ import {
 import { removeTeammateFromTeamFile, readTeamFile, getTeamFilePath, unregisterTeamForSessionCleanup } from '../utils/swarm/teamHelpers.js'
 import { clearLeaderTeamName, setLeaderTeamName } from '../utils/tasks.js'
 import { clearTeammateColors } from '../utils/swarm/teammateLayoutManager.js'
-import { buildTeamRuntimeSnapshot } from '../utils/swarm/teamRuntimeSnapshot.js'
+import { buildTeamRuntimeSnapshot, confirmTeamRuntimeResume, teamRuntimeSnapshotHoldsMail } from '../utils/swarm/teamRuntimeSnapshot.js'
 import { getCanonicalTeamTaskListId, listTasks, unassignTeammateTasks } from '../utils/tasks.js'
 import { getRunningTasks } from '../utils/task/framework.js'
 import { isBackgroundTask } from '../tasks/types.js'
@@ -446,6 +454,7 @@ export function createShutdownTeamPrompt(): QueuedCommand {
 export const MAX_LEAD_MAILBOX_ACK_FAILURES = 5
 
 export type LeadMailboxPollState = {
+  revision: number
   /** The unread mail left once the last teammate went away was drained. */
   finalDrainDone: boolean
   /** Consecutive polls whose batch could not be acknowledged. */
@@ -458,7 +467,18 @@ export type LeadMailboxPollState = {
 }
 
 export function createLeadMailboxPollState(): LeadMailboxPollState {
-  return { finalDrainDone: false, consecutiveAckFailures: 0, held: false }
+  return { revision: 0, finalDrainDone: false, consecutiveAckFailures: 0, held: false }
+}
+
+/** A confirmed human intent also restarts a poll that already returned. */
+export function resumeLeadMailboxPoll(state: LeadMailboxPollState, run: () => Promise<void>): void {
+  Object.assign(state, createLeadMailboxPollState(), { revision: state.revision + 1 })
+  void run()
+}
+
+export function pauseLeadMailboxPoll(state: LeadMailboxPollState): void {
+  state.held = true
+  state.revision++
 }
 
 export type LeadMailboxPollStep =
@@ -480,8 +500,11 @@ export async function takeLeadMailboxBatch(
   options: { teamName: string | undefined; hasActiveTeammates: boolean },
 ): Promise<LeadMailboxPollStep> {
   const { teamName, hasActiveTeammates } = options
-  if (state.held) return { kind: 'held' }
+  const revision = state.revision
+  const fresh = () => !state.held && state.revision === revision
+  if (!fresh()) return { kind: 'held' }
   const unread = await readUnreadMessages(TEAM_LEAD_NAME, teamName)
+  if (!fresh()) return { kind: 'held' }
 
   if (!hasActiveTeammates) {
     if (
@@ -490,7 +513,7 @@ export async function takeLeadMailboxBatch(
       state.consecutiveAckFailures >= MAX_LEAD_MAILBOX_ACK_FAILURES
     ) {
       if (unread.length === 0) {
-        Object.assign(state, createLeadMailboxPollState())
+        Object.assign(state, createLeadMailboxPollState(), { revision })
       }
       return { kind: 'stop' }
     }
@@ -504,7 +527,11 @@ export async function takeLeadMailboxBatch(
     return { kind: 'idle' }
   }
 
-  const claimed = await claimMailboxMessages(TEAM_LEAD_NAME, teamName, unread)
+  const claimed = await claimMailboxMessages(TEAM_LEAD_NAME, teamName, unread, fresh)
+  if (!fresh()) {
+    if (claimed) await returnClaimedMailboxMessages(TEAM_LEAD_NAME, teamName, claimed)
+    return { kind: 'held' }
+  }
   if (claimed) {
     state.consecutiveAckFailures = 0
     if (claimed.length === 0) {
@@ -668,7 +695,9 @@ export function canBatchWith(
     !isPendingSessionMessage(head.uuid) &&
     !isPendingSessionMessage(next.uuid) &&
     next.workload === head.workload &&
-    next.isMeta === head.isMeta
+    next.isMeta === head.isMeta &&
+    !requiresComputerUse(head) &&
+    !requiresComputerUse(next)
   )
 }
 
@@ -1127,6 +1156,7 @@ export async function runHeadless(
           message.subtype === 'task_notification' ||
           message.subtype === 'task_started' ||
           message.subtype === 'task_progress' ||
+          message.subtype === 'prompt_suggestion_activity' ||
           message.subtype === 'post_turn_summary')
       ) &&
       message.type !== 'stream_event' &&
@@ -1200,6 +1230,17 @@ export async function runHeadless(
   gracefulShutdownSync(
     lastMessage?.type === 'result' && lastMessage?.is_error ? 1 : 0,
   )
+}
+
+export function createPromptSuggestionActivityEmitter(structuredIO: StructuredIO) {
+  return (generationId: string, active: boolean) => structuredIO.outbound.enqueue({
+    type: 'system',
+    subtype: 'prompt_suggestion_activity',
+    generation_id: generationId,
+    active,
+    uuid: randomUUID(),
+    session_id: getSessionId(),
+  })
 }
 
 export function bindAgentRunMessageSink(structuredIO: StructuredIO): () => void {
@@ -1299,6 +1340,9 @@ function runHeadlessStreaming(
     | 'finally_post_flush'
     | undefined
   let inputClosed = false
+  // EOF can still require team shutdown. Disposal starts only once terminal
+  // cleanup is chosen, so suspended polls cannot outlive this output stream.
+  let disposed = false
   let shutdownPromptInjected = false
   const leadMailboxPoll = createLeadMailboxPollState()
   const teamFinishedReminder: TeamFinishedReminderState = {}
@@ -1375,33 +1419,7 @@ function runHeadlessStreaming(
   })
 
   // Prompt suggestion tracking (push model)
-  const suggestionState: {
-    abortController: AbortController | null
-    inflightPromise: Promise<void> | null
-    lastEmitted: {
-      text: string
-      emittedAt: number
-      promptId: PromptVariant
-      generationRequestId: string | null
-    } | null
-    pendingSuggestion: {
-      type: 'prompt_suggestion'
-      suggestion: string
-      uuid: UUID
-      session_id: string
-    } | null
-    pendingLastEmittedEntry: {
-      text: string
-      promptId: PromptVariant
-      generationRequestId: string | null
-    } | null
-  } = {
-    abortController: null,
-    inflightPromise: null,
-    lastEmitted: null,
-    pendingSuggestion: null,
-    pendingLastEmittedEntry: null,
-  }
+  const suggestionState = createSdkSuggestionState()
 
   // Set up AWS auth status listener if enabled
   let unsubscribeAuthStatus: (() => void) | undefined
@@ -2218,7 +2236,7 @@ function runHeadlessStreaming(
   })
 
   const run = async () => {
-    if (running) {
+    if (running || disposed) {
       return
     }
 
@@ -2282,6 +2300,16 @@ function runHeadlessStreaming(
       let command: QueuedCommand | undefined
       let waitingForAgents = false
 
+      const startPushSuggestion = (cacheSafeParams: CacheSafeParams) =>
+        startSdkPushSuggestion(suggestionState, {
+          cacheSafeParams,
+          messages: mutableMessages,
+          getAppState,
+          isResultHeld: () => heldBackResult !== null,
+          emit: message => output.enqueue(message),
+          onActivity: createPromptSuggestionActivityEmitter(structuredIO),
+        })
+
       // Extract command processing into a named function for the do-while pattern.
       // Drains the queue, batching consecutive prompt-mode commands into one
       // ask() call so messages that queued up during a long turn coalesce
@@ -2315,6 +2343,13 @@ function runHeadlessStreaming(
             }
           }
           const batchUuids = batch.map(c => c.uuid).filter(u => u !== undefined)
+          // A host notice can batch with the user's next message; the turn is
+          // still the user's when any batched command was typed by them.
+          const userStartedTurn = batch.some(isUserStartedCommand)
+          // Stop hooks save a fresh fork context only when a turn finishes
+          // normally; compare against this to spot interrupted turns and
+          // local slash commands that never reached the model.
+          const cacheSafeParamsAtTurnStart = getLastCacheSafeParams()
 
           // QueryEngine will emit a replay for command.uuid (the last uuid in
           // the batch) via its messagesToAck path. Emit replays here for the
@@ -2410,6 +2445,9 @@ function runHeadlessStreaming(
           suggestionState.abortController = null
           suggestionState.pendingSuggestion = null
           suggestionState.pendingLastEmittedEntry = null
+          // A new message from the user replaces a prediction still owed to
+          // an earlier turn that was waiting on background agents.
+          if (userStartedTurn) suggestionState.deferredUntilAgentsSettle = false
           if (suggestionState.lastEmitted) {
             if (command.mode === 'prompt') {
               // SDK user messages enqueue ContentBlockParam[], not a plain string
@@ -2447,6 +2485,9 @@ function runHeadlessStreaming(
           // const-capture: TS loses `while ((command = dequeue()))` narrowing
           // inside the closure.
           const cmd = command
+          const requiredComputerUse = requiresComputerUse(cmd) && !isPendingSessionMessage(cmd.uuid)
+            ? { unavailableMessage: computerUseUnavailableMessage(computerUseMcp.unavailableReason()) }
+            : undefined
           await runWithWorkload(cmd.workload ?? options.workload, async () => {
             for await (const message of ask({
               commands: uniqBy(
@@ -2505,6 +2546,7 @@ function runHeadlessStreaming(
                 ),
               agents: currentAgents,
               orphanedPermission: cmd.orphanedPermission,
+              requiredComputerUse,
               setSDKStatus: (status, detail) => {
                 output.enqueue({
                   type: 'system',
@@ -2583,92 +2625,17 @@ function runHeadlessStreaming(
             )
           }
 
-          // Generate and emit prompt suggestion for SDK consumers
-          if (
-            options.promptSuggestions &&
-            !isEnvDefinedFalsy(process.env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION)
-          ) {
-            // TS narrows suggestionState to never in the while loop body;
-            // cast via unknown to reset narrowing.
-            const state = suggestionState as unknown as typeof suggestionState
-            state.abortController?.abort()
-            const localAbort = new AbortController()
-            suggestionState.abortController = localAbort
-
-            const cacheSafeParams = getLastCacheSafeParams()
-            if (!cacheSafeParams) {
-              logSuggestionSuppressed(
-                'sdk_no_params',
-                undefined,
-                undefined,
-                'sdk',
-              )
-            } else {
-              // Use a ref object so the IIFE's finally can compare against its own
-              // promise without a self-reference (which upsets TypeScript's flow analysis).
-              const ref: { promise: Promise<void> | null } = { promise: null }
-              ref.promise = (async () => {
-                try {
-                  const result = await tryGenerateSuggestion(
-                    localAbort,
-                    mutableMessages,
-                    getAppState,
-                    cacheSafeParams,
-                    'sdk',
-                  )
-                  if (!result || localAbort.signal.aborted) return
-                  const suggestionMsg = {
-                    type: 'prompt_suggestion' as const,
-                    suggestion: result.suggestion,
-                    uuid: randomUUID(),
-                    session_id: getSessionId(),
-                  }
-                  const lastEmittedEntry = {
-                    text: result.suggestion,
-                    emittedAt: Date.now(),
-                    promptId: result.promptId,
-                    generationRequestId: result.generationRequestId,
-                  }
-                  // Defer emission if the result is being held for background agents,
-                  // so that prompt_suggestion always arrives after result.
-                  // Only set lastEmitted when the suggestion is actually delivered
-                  // to the consumer; deferred suggestions may be discarded before
-                  // delivery if a new command arrives first.
-                  if (heldBackResult) {
-                    suggestionState.pendingSuggestion = suggestionMsg
-                    suggestionState.pendingLastEmittedEntry = {
-                      text: lastEmittedEntry.text,
-                      promptId: lastEmittedEntry.promptId,
-                      generationRequestId: lastEmittedEntry.generationRequestId,
-                    }
-                  } else {
-                    suggestionState.lastEmitted = lastEmittedEntry
-                    output.enqueue(suggestionMsg)
-                  }
-                } catch (error) {
-                  if (
-                    error instanceof Error &&
-                    (error.name === 'AbortError' ||
-                      error.name === 'APIUserAbortError')
-                  ) {
-                    logSuggestionSuppressed(
-                      'aborted',
-                      undefined,
-                      undefined,
-                      'sdk',
-                    )
-                    return
-                  }
-                  logError(toError(error))
-                } finally {
-                  if (suggestionState.inflightPromise === ref.promise) {
-                    suggestionState.inflightPromise = null
-                  }
-                }
-              })()
-              suggestionState.inflightPromise = ref.promise
-            }
-          }
+          // Generate and emit prompt suggestion for SDK consumers.
+          const suggestionContext = takeSdkSuggestionContext(suggestionState, {
+            enabled:
+              !!options.promptSuggestions &&
+              !isEnvDefinedFalsy(process.env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION),
+            userStartedTurn,
+            resultHeld: heldBackResult !== null,
+            cacheSafeParams: getLastCacheSafeParams(),
+            cacheSafeParamsAtTurnStart,
+          })
+          if (suggestionContext) startPushSuggestion(suggestionContext)
 
           // Log headless profiler metrics for this turn and start next turn
           logHeadlessProfilerTurn()
@@ -2707,7 +2674,7 @@ function runHeadlessStreaming(
           const hasMainThreadQueued = peek(isMainThread) !== undefined
           const agentFollowUp = deferredAgentNotifications.takeIfSettled(hasRunningBg || hasMainThreadQueued)
           if (agentFollowUp) {
-            enqueue({ mode: 'prompt', value: agentFollowUp, priority: 'later', isMeta: true })
+            enqueue({ mode: 'prompt', value: agentFollowUp, priority: 'later', isMeta: true, origin: { kind: 'task-notification' } })
           }
           if (hasRunningBg || hasMainThreadQueued || agentFollowUp) {
             waitingForAgents = true
@@ -2724,6 +2691,14 @@ function runHeadlessStreaming(
       if (heldBackResult) {
         output.enqueue(heldBackResult)
         heldBackResult = null
+        // Agents settled without a follow-up turn: predict for the finished
+        // user turn now that its result is out.
+        const owedContext = takeOwedSdkSuggestionContext(
+          suggestionState,
+          !!options.promptSuggestions,
+          getLastCacheSafeParams(),
+        )
+        if (owedContext) startPushSuggestion(owedContext)
         if (suggestionState.pendingSuggestion) {
           output.enqueue(suggestionState.pendingSuggestion)
           // Now that the suggestion is actually delivered, record it for acceptance tracking
@@ -2824,15 +2799,18 @@ function runHeadlessStreaming(
         const POLL_INTERVAL_MS = 500
 
         while (true) {
+          if (disposed) return
           // Check if teammates are still active
           const refreshedState = getAppState()
           const teamName = refreshedState.teamContext?.teamName
           // Claims exactly the batch it read before handing it out, and
           // drains leftover mail once after the last teammate is gone.
+          const pollRevision = leadMailboxPoll.revision
           const step = await takeLeadMailboxBatch(leadMailboxPoll, {
             teamName,
             hasActiveTeammates: hasTeammatesRequiringShutdown(refreshedState),
           })
+          if (disposed) return
 
           if (step.kind === 'stop') {
             logForDebugging(
@@ -2842,6 +2820,7 @@ function runHeadlessStreaming(
           }
 
           if (step.kind === 'held') {
+            if (!leadMailboxPoll.held) { void run(); return }
             logForDebugging(
               '[print.ts] Team paused by the host; teammate mail waits for the next user message',
             )
@@ -2905,6 +2884,7 @@ function runHeadlessStreaming(
                     agentId: teammateId,
                     name: teammateToRemove,
                   })
+                  if (disposed) return
                   logForDebugging(
                     `[print.ts] Removed ${teammateToRemove} from team file`,
                   )
@@ -2916,6 +2896,7 @@ function runHeadlessStreaming(
                     teammateToRemove,
                     'shutdown',
                   )
+                  if (disposed) return
 
                   // Remove from teamContext in AppState
                   setAppState(prev => {
@@ -2943,11 +2924,17 @@ function runHeadlessStreaming(
             // Permission requests stay out of the model context.
             const formatted = formatTeammateMessages(partitioned.remaining)
 
+            if (leadMailboxPoll.held || leadMailboxPoll.revision !== pollRevision) {
+              await returnClaimedMailboxMessages(TEAM_LEAD_NAME, teamName, partitioned.remaining)
+              if (!leadMailboxPoll.held) { void run(); return }
+              break
+            }
             // Enqueue and process
             enqueue({
               mode: 'prompt',
               value: formatted,
               uuid: randomUUID(),
+              isSynthetic: true,
             })
             void run()
             return // run() will come back here after processing
@@ -2971,6 +2958,7 @@ function runHeadlessStreaming(
             teamFinishedReminder,
             teamName,
           )
+          if (disposed) return
           if (teamFinishedPrompt) {
             logForDebugging(
               '[print.ts] Approved team finished, reminding the lead to shut it down',
@@ -2999,12 +2987,14 @@ function runHeadlessStreaming(
         const refreshedAppState = getAppState()
         return hasTeammatesRequiringShutdown(refreshedAppState)
       })()
+      if (disposed) return
 
       if (hasActiveSwarm) {
         // Team members are idle or pane-based - inject prompt to shut down team
         enqueue(createShutdownTeamPrompt())
         void run()
       } else {
+        disposed = true
         // Wait for any in-flight push suggestion before closing the output stream.
         if (suggestionState.inflightPromise) {
           await Promise.race([suggestionState.inflightPromise, sleep(5000)])
@@ -3185,10 +3175,20 @@ function runHeadlessStreaming(
           }
         } else if (message.request.subtype === 'team_runtime_snapshot') {
           try {
-            const teamContext = buildTeamRuntimeSnapshot(readTeamFile(message.request.team_name), message.request.created_at, getSessionId(), getTeamFilePath(message.request.team_name))
+            const team = readTeamFile(message.request.team_name)
+            const teamContext = buildTeamRuntimeSnapshot(team, message.request.created_at, getSessionId(), getTeamFilePath(message.request.team_name))
+            if (team && teamRuntimeSnapshotHoldsMail(team)) pauseLeadMailboxPoll(leadMailboxPoll)
             setLeaderTeamName(teamContext.teamName)
             setAppState(prev => ({ ...prev, teamContext }))
             sendControlResponseSuccess(message)
+          } catch (error) {
+            sendControlResponseError(message, error instanceof Error ? error.message : String(error))
+          }
+        } else if (message.request.subtype === 'team_runtime_resume') {
+          try {
+            const acknowledgement = confirmTeamRuntimeResume(readTeamFile(message.request.team_name), getSessionId(), message.request)
+            sendControlResponseSuccess(message, acknowledgement)
+            resumeLeadMailboxPoll(leadMailboxPoll, run)
           } catch (error) {
             sendControlResponseError(message, error instanceof Error ? error.message : String(error))
           }
@@ -3206,7 +3206,7 @@ function runHeadlessStreaming(
           sendControlResponseSuccess(message)
         } else if (message.request.subtype === 'interrupt' || message.request.subtype === 'team_plan_pause') {
           sessionMessageInbox.cancelQueued(dequeueAllMatching)
-          if (message.request.subtype === 'team_plan_pause') leadMailboxPoll.held = true
+          if (message.request.subtype === 'team_plan_pause') pauseLeadMailboxPoll(leadMailboxPoll)
           // Track escapes for attribution (ant-only feature)
           if (feature('COMMIT_ATTRIBUTION')) {
             setAppState(prev => ({
@@ -3331,6 +3331,10 @@ function runHeadlessStreaming(
           injectModelSwitchBreadcrumbs(requestedModel, model)
 
           sendControlResponseSuccess(message)
+        } else if (message.request.subtype === 'set_prompt_suggestions') {
+          options.promptSuggestions = message.request.enabled
+          setSdkPromptSuggestions(suggestionState, message.request.enabled, setAppState)
+          sendControlResponseSuccess(message)
         } else if (message.request.subtype === 'set_max_thinking_tokens') {
           if (message.request.max_thinking_tokens === null) {
             options.thinkingConfig = undefined
@@ -3351,17 +3355,32 @@ function runHeadlessStreaming(
           sendControlResponseSuccess(message, getSessionUsageSnapshot())
         } else if (message.request.subtype === 'get_context_usage') {
           try {
+            const mainLoopModel = getMainLoopModel()
+            const savedPrefix = getLastCacheSafeParams()
+            const cacheSafeParams = savedPrefix?.toolUseContext.getAppState === getAppState ? savedPrefix : null
+            const summary = message.request.summaryOnly
+              ? collectContextSummary({
+                  messages: mutableMessages,
+                  mainLoopModel,
+                  cacheSafeParams,
+                })
+              : null
+            if (summary) {
+              sendControlResponseSuccess(message, { ...summary })
+              continue
+            }
             const appState = getAppState()
             const data = await collectContextData({
               messages: mutableMessages,
               getAppState,
               options: {
-                mainLoopModel: getMainLoopModel(),
+                mainLoopModel,
                 tools: buildAllTools(appState),
                 agentDefinitions: appState.agentDefinitions,
                 customSystemPrompt: options.systemPrompt,
                 appendSystemPrompt: options.appendSystemPrompt,
                 estimateOnly: Boolean(message.request.estimateOnly),
+                cacheSafeParams,
               },
             })
             sendControlResponseSuccess(message, { ...data })
@@ -4668,6 +4687,7 @@ function runHeadlessStreaming(
       // The user speaking again ends a host pause: mail held since then reaches
       // the lead after this turn, alongside whatever the user now wants.
       leadMailboxPoll.held = false
+      leadMailboxPoll.revision++
       enqueue({
         mode: 'prompt' as const,
         // file_attachments rides the protobuf catchall from the web composer.
@@ -4675,6 +4695,7 @@ function runHeadlessStreaming(
         value: await resolveAndPrepend(message, message.message.content),
         uuid: message.uuid,
         priority: message.priority,
+        ...(message.isSynthetic ? { isSynthetic: true } : {}),
       })
       // Increment prompt count for attribution tracking and save snapshot
       // The snapshot persists promptCount so it survives compaction
@@ -4693,6 +4714,7 @@ function runHeadlessStreaming(
     inputClosed = true
     cronScheduler?.stop()
     if (!running) {
+      disposed = true
       // If a push-suggestion is in-flight, wait for it to emit before closing
       // the output stream (5 s safety timeout to prevent hanging).
       if (suggestionState.inflightPromise) {
@@ -5536,6 +5558,9 @@ async function loadInitialMessages(
             ? { ...result, worktreeSession: undefined }
             : result,
         )
+        // Cd back into the worktree the session was working in, as the
+        // interactive resume does (processResumedConversation).
+        if (!options.forkSession) restoreWorktreeForResume(result.worktreeSession)
 
         // Write mode entry for the resumed session
         if (feature('COORDINATOR_MODE') && coordinatorModeModule) {
@@ -5720,6 +5745,9 @@ async function loadInitialMessages(
           ? { ...result, worktreeSession: undefined }
           : result,
       )
+      // Cd back into the worktree the session was working in, as the
+      // interactive resume does (processResumedConversation).
+      if (!options.forkSession) restoreWorktreeForResume(result.worktreeSession)
 
       // Write mode entry for the resumed session
       if (feature('COORDINATOR_MODE') && coordinatorModeModule) {

@@ -21,6 +21,7 @@ import {
 } from '../../api/sessions'
 import { useTranslation } from '../../i18n'
 import { useUIStore } from '../../stores/uiStore'
+import { desktopUiPreferencesApi } from '@/api/desktopUiPreferences'
 import { setProjectDisplayName, useProjectDisplayName } from '../../stores/projectDisplayNameStore'
 import { RecentProjectsPanel } from '@/components/composite/DirectoryPicker'
 import { resolveVerticalPlacement } from '@/lib/verticalPlacement'
@@ -78,6 +79,8 @@ export type RepositoryLaunchControlsHandle = {
    * the folder as it is.
    */
   resolveLaunchBranch: () => Promise<string | null>
+  /** Re-reads the repository context (e.g. when focus returns from the docked terminal). */
+  refreshContext: () => void
 }
 
 /**
@@ -396,7 +399,8 @@ export const RepositoryLaunchControls = forwardRef<RepositoryLaunchControlsHandl
       }
       return next
     },
-  }), [onBranchChange, setAutomaticBranch])
+    refreshContext,
+  }), [onBranchChange, refreshContext, setAutomaticBranch])
 
   // A new directory starts over. A parent that keeps the launch target and
   // mounts these controls again later says which branch was chosen for the
@@ -641,7 +645,11 @@ export const RepositoryLaunchControls = forwardRef<RepositoryLaunchControlsHandl
   }
 
   const handleProjectCreateSubmit = async (submission: ProjectEditorSubmission) => {
-    await setProjectDisplayName(submission.sourceFolder, submission.name)
+    const project = await desktopUiPreferencesApi.updateProjectDirectories(submission.sourceFolder, submission.additionalDirectories, { createProject: true })
+    await setProjectDisplayName(project.projectKey, submission.name)
+    if (contextSourceWorkDir === submission.sourceFolder) {
+      setContext((current) => current ? { ...current, projectRoot: project.projectKey } : current)
+    }
     invalidateRecentProjectsCache()
     setProjectCreateOpen(false)
     // Naming the folder already in use only renames it.
@@ -703,10 +711,13 @@ export const RepositoryLaunchControls = forwardRef<RepositoryLaunchControlsHandl
   }, [revealAfterPick, loading, context, contextSourceWorkDir, error, workDir, closeMenu])
 
   const projectKey = contextSourceWorkDir === workDir && context
-    ? (context.repoRoot || context.workDir)
+    ? (context.projectRoot || context.repoRoot || context.workDir)
     : workDir
   const displayName = useProjectDisplayName(projectKey)
-  const repoLabel = displayName || context?.repoName || basename(context?.repoRoot) || basename(workDir)
+  const projectFolderLabel = context?.projectRoot && context.projectRoot !== context.repoRoot
+    ? basename(context.projectRoot)
+    : null
+  const repoLabel = displayName || projectFolderLabel || context?.repoName || basename(context?.repoRoot) || basename(workDir)
   const selectedBranchName = isGitReady ? (selectedBranch?.name ?? null) : null
   // A detached HEAD has no branch to name and none is chosen for it (that would
   // switch the user off their commit); the commit says where the checkout is.

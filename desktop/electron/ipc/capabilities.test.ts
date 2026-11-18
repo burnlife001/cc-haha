@@ -9,6 +9,14 @@ import {
 } from './capabilities'
 
 describe('Electron IPC capabilities', () => {
+  it('allows only an optional WeChat target for adapter restart', () => {
+    const channel = ELECTRON_IPC_CHANNELS.adaptersRestartSidecar
+    expect(validateElectronIpcPayload(channel, undefined)).toBe(true)
+    expect(validateElectronIpcPayload(channel, { target: 'wechat' })).toBe(true)
+    for (const payload of [null, {}, { target: 'feishu' }, { target: 'wechat', command: 'anything' }]) {
+      expect(validateElectronIpcPayload(channel, payload)).toBe(false)
+    }
+  })
   it('accepts only boolean power preferences and denies the pet renderer access', () => {
     const channel = ELECTRON_IPC_CHANNELS.powerSetPreventSleepWhileRunning
     expect(validateElectronIpcPayload(channel, true)).toBe(true)
@@ -257,6 +265,7 @@ describe('Electron IPC capabilities', () => {
       followSystem: false,
     }
     expect(validateElectronIpcPayload(ELECTRON_IPC_CHANNELS.appearanceSetApplied, valid)).toBe(true)
+    expect(validateElectronIpcPayload(ELECTRON_IPC_CHANNELS.appearanceSetApplied, { ...valid, darkBackground: '#202020' })).toBe(true)
 
     for (const invalid of [
       undefined,
@@ -270,6 +279,10 @@ describe('Electron IPC capabilities', () => {
       { ...valid, background: '#800E0E0E' },
       { ...valid, lightBackground: '#80FFFFFF' },
       { ...valid, lightBackground: 'white' },
+      { ...valid, darkBackground: '#80202020' },
+      { ...valid, darkBackground: '#222' },
+      { ...valid, darkBackground: 'black' },
+      { ...valid, darkBackground: null },
       { ...valid, extra: 1 },
     ]) {
       expect(

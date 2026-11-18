@@ -177,6 +177,17 @@ export const SDKControlSetMaxThinkingTokensRequestSchema = lazySchema(() =>
     ),
 )
 
+export const SDKControlSetPromptSuggestionsRequestSchema = lazySchema(() =>
+  z
+    .object({
+      subtype: z.literal('set_prompt_suggestions'),
+      enabled: z.boolean(),
+    })
+    .describe(
+      'Turns next-prompt suggestions on or off for subsequent turns. Unlike the initialize option, it can be sent at any time.',
+    ),
+)
+
 export const SDKControlMcpStatusRequestSchema = lazySchema(() =>
   z
     .object({
@@ -200,6 +211,7 @@ export const SDKControlGetContextUsageRequestSchema = lazySchema(() =>
     .object({
       subtype: z.literal('get_context_usage'),
       estimateOnly: z.boolean().optional(),
+      summaryOnly: z.boolean().optional(),
     })
     .describe(
       'Requests a breakdown of current context window usage by category.',
@@ -272,6 +284,7 @@ export const SDKControlGetContextUsageResponseSchema = lazySchema(() =>
   z
     .object({
       categories: z.array(ContextCategorySchema()),
+      summaryOnly: z.boolean().optional(),
       totalTokens: z.number(),
       maxTokens: z.number(),
       rawMaxTokens: z.number(),
@@ -647,6 +660,7 @@ export const SDKControlRequestInnerSchema = lazySchema(() =>
     z.object({ subtype: z.literal('team_runtime_snapshot'), team_name: z.string().min(1), created_at: z.number() }),
     z.object({ subtype: z.literal('team_runtime_ended'), team_name: z.string().min(1) }),
     z.object({ subtype: z.literal('team_plan_pause') }),
+    z.object({ subtype: z.literal('team_runtime_resume'), team_name: z.string().min(1), created_at: z.number(), incarnation_id: z.string().min(1), epoch: z.number().int().positive(), request_id: z.string().min(1) }),
     sessionMessageInputSchema,
     scheduledTaskMessageInputSchema,
     SDKControlInterruptRequestSchema(),
@@ -656,6 +670,7 @@ export const SDKControlRequestInnerSchema = lazySchema(() =>
     SDKControlSetComputerUseApprovalTokenRequestSchema(),
     SDKControlSetModelRequestSchema(),
     SDKControlSetMaxThinkingTokensRequestSchema(),
+    SDKControlSetPromptSuggestionsRequestSchema(),
     SDKControlMcpStatusRequestSchema(),
     SDKControlGetContextUsageRequestSchema(),
     SDKControlGetSessionUsageRequestSchema(),

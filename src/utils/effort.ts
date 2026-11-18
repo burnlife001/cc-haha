@@ -17,6 +17,9 @@ import {
   isOpenAIResponsesModel,
 } from 'src/services/openaiAuth/models.js'
 import { GROK_MODEL_CATALOG, getGrokRuntimeModelCatalog } from 'src/services/grokAuth/models.js'
+import {
+  resolveConfiguredEffortSetting,
+} from '../shared/modelReasoning.js'
 import { readProviderEnv } from './model/providerEnvScope.js'
 
 export type EffortLevel = RuntimeEffortLevel | 'xhigh'
@@ -224,9 +227,12 @@ export function toPersistableEffort(
 }
 
 export function getInitialEffortSetting(): EffortLevel | undefined {
-  // toPersistableEffort filters 'max' for non-ants on read, so a manually
-  // edited settings.json doesn't leak session-scoped max into a fresh session.
-  return toPersistableEffort(getInitialSettings().effortLevel)
+  // resolveConfiguredEffortSetting filters external 'max' on effortLevel while
+  // keeping 'xhigh'/'max' persisted via cc-haha's `effort` field deterministic.
+  return resolveConfiguredEffortSetting(
+    getInitialSettings() as { effort?: unknown; effortLevel?: unknown },
+    { allowAntMaxEffortLevel: process.env.USER_TYPE === 'ant' },
+  )
 }
 
 /**
@@ -444,10 +450,11 @@ export function getDefaultEffortForModel(
   // the model launch DRI and research. Default effort is a sensitive setting
   // that can greatly affect model quality and bashing.
 
-  // Claude Code runs Opus 5.5, Sonnet 5.5 and Haiku 5.5 at medium; the API
-  // default for Sonnet 5.5 is high, so it must be sent explicitly.
+  // Claude Code runs Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.2 at medium; the
+  // API default for Sonnet 5.5 and Fable 5.2 is high, so it must be sent explicitly.
   const canonicalModel = getCanonicalName(model)
   if (
+    canonicalModel === 'claude-fable-5-2' ||
     canonicalModel === 'claude-opus-5-5' ||
     canonicalModel === 'claude-sonnet-5-5' ||
     canonicalModel === 'claude-haiku-5-5'

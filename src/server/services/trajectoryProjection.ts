@@ -609,6 +609,11 @@ export function projectTrajectoryRows(entries: ProjectionEntry[], options: Proje
       const results = Array.isArray(content) ? content.filter((block): block is Rec => isRecord(block) && block.type === 'tool_result') : []
       if (results.length) {
         const toolUseResult = isRecord(entry.toolUseResult) ? entry.toolUseResult : undefined
+        const rawDurationMs = num(entry.durationMs)
+        const entryDurationMs =
+          results.length === 1 && rawDurationMs !== undefined && rawDurationMs >= 0
+            ? rawDurationMs
+            : undefined
         for (const block of results) {
           const toolUseId = str(block.tool_use_id)
           if (!toolUseId) continue
@@ -617,6 +622,7 @@ export function projectTrajectoryRows(entries: ProjectionEntry[], options: Proje
           patchTool(toolUseId, ts, loc, {
             resultPreview: toolResultPreview(block.content, text),
             resultTs: ts,
+            ...(entryDurationMs !== undefined ? { durationMs: entryDurationMs } : {}),
             ...(block.is_error === true ? { isError: true } : {}),
             ...(agentId ? { agentId } : {}),
           })
@@ -658,7 +664,8 @@ export function projectTrajectoryRows(entries: ProjectionEntry[], options: Proje
       const messageId = str(message.id) ?? uuid
       const content = Array.isArray(message.content) ? message.content.filter(isRecord) : []
       const text = content.find(block => block.type === 'text' && typeof block.text === 'string' && block.text.trim())
-      const thinking = content.some(block => block.type === 'thinking' || block.type === 'redacted_thinking')
+      const thinking = content.some(block => block.type === 'redacted_thinking'
+        || (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.trim().length > 0))
       const stopReason = str(message.stop_reason)
       const isError = entry.isApiErrorMessage === true || entry.error !== undefined
       const usage = isForkInherited(entry) ? undefined : mapUsage(message.usage)

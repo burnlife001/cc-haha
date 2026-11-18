@@ -9,7 +9,7 @@ import { getServerBaseUrl } from '@/lib/desktopRuntime'
 import { useWorkspaceContentStore } from '@/stores/workspaceContentStore'
 import { Component, useRef, useEffect, useMemo, memo, useState, useCallback, useDeferredValue, useLayoutEffect, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { createPortal, flushSync } from 'react-dom'
-import { ArrowDown, BookMarked, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, FileStack, LoaderCircle, Settings, Target, Undo2, XCircle } from 'lucide-react'
+import { ArrowDown, BookMarked, ChevronDown, ChevronRight, FileStack, LoaderCircle, Settings, Target, Undo2 } from 'lucide-react'
 import { ApiError } from '../../api/client'
 import { sessionsApi, type SessionRewindMode, type SessionTurnCheckpoint, type WorkspaceChangedFile } from '../../api/sessions'
 import { listPendingPermissions, useChatStore } from '../../stores/chatStore'
@@ -37,6 +37,7 @@ import {
 import type { ActivityStep } from './activityGroupModel'
 import { ToolResultBlock } from './ToolResultBlock'
 import { PermissionDialog } from './PermissionDialog'
+import { MagpieConnectionHint, isCliApiErrorText } from './MagpieConnectionHint'
 import { AskUserQuestion } from './AskUserQuestion'
 import { RenderItemBoundary } from './RenderItemBoundary'
 import { StreamingIndicator } from './StreamingIndicator'
@@ -63,7 +64,7 @@ import {
 import type { AgentTaskNotification, BackgroundAgentTask, UIMessage } from '../../types/chat'
 import type { TeamDetail, TeamWorkbenchSnapshot } from '../../types/team'
 import { formatTokenCount } from '../../lib/formatTokenCount'
-import { formatDurationMs, hasRunningBackgroundTasks as hasAnyRunningBackgroundTasks } from '../../lib/backgroundTasks'
+import { hasRunningBackgroundTasks as hasAnyRunningBackgroundTasks } from '../../lib/backgroundTasks'
 import { buildTurnCompletionByMessageId, type TurnCompletion } from '../../lib/turnCompletion'
 import type { TurnOutputEvidence } from '../../lib/assistantOutputTargets'
 import { isTouchH5Document } from '../../lib/touchH5'
@@ -92,7 +93,6 @@ type ToolCall = Extract<UIMessage, { type: 'tool_use' }>
 type ToolResult = Extract<UIMessage, { type: 'tool_result' }>
 type MemoryEvent = Extract<UIMessage, { type: 'memory_event' }>
 type GoalEvent = Extract<UIMessage, { type: 'goal_event' }>
-type BackgroundTaskEvent = Extract<UIMessage, { type: 'background_task' }>
 type CompactSummaryEvent = Extract<UIMessage, { type: 'compact_summary' }>
 
 type RenderItem =
@@ -468,86 +468,6 @@ function GoalContinuationDivider({ message }: { message: GoalEvent }) {
       </div>
     </section>
   )
-}
-
-function BackgroundTaskEventCard({ message }: { message: BackgroundTaskEvent }) {
-  const t = useTranslation()
-  const { task } = message
-  const isRunning = task.status === 'running'
-  const isFailed = task.status === 'failed'
-  const isStopped = task.status === 'stopped'
-  const duration = formatDurationMs(task.usage?.durationMs, t)
-  const detail = task.summary || task.lastToolName || task.description || task.outputFile || task.taskId
-  const label = getBackgroundTaskLabel(task.taskType, t)
-
-  return (
-    <div className="mb-2">
-      <div
-        data-testid="background-task-event-card"
-        data-status={task.status}
-        className="flex min-w-0 items-start gap-2 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3 py-2"
-      >
-        <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
-          {isRunning ? (
-            <LoaderCircle size={15} strokeWidth={1.75} className="animate-spin text-[var(--color-info)]" aria-hidden="true" />
-          ) : isFailed ? (
-            <XCircle size={15} strokeWidth={2.25} className="text-[var(--color-error)]" aria-hidden="true" />
-          ) : isStopped ? (
-            <CircleStop size={15} strokeWidth={2.25} className="text-[var(--color-text-tertiary)]" aria-hidden="true" />
-          ) : (
-            <CheckCircle2 size={15} strokeWidth={2.25} className="text-[var(--color-success)]" aria-hidden="true" />
-          )}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2">
-            <Bot size={14} strokeWidth={2.25} className="shrink-0 text-[var(--color-text-tertiary)]" aria-hidden="true" />
-            <span className="shrink-0 text-[12px] font-medium text-[var(--color-text-primary)]">
-              {label}
-            </span>
-            <span className="shrink-0 text-[11px] text-[var(--color-text-tertiary)]">
-              {t(`chat.backgroundAgents.status.${task.status}`)}
-            </span>
-            {task.usage?.totalTokens ? (
-              <span className="hidden shrink-0 text-[11px] text-[var(--color-text-tertiary)] sm:inline">
-                {t('chat.backgroundAgents.tokens', { count: formatTokenCount(task.usage.totalTokens) })}
-              </span>
-            ) : null}
-            {duration ? (
-              <span className="hidden shrink-0 text-[11px] text-[var(--color-text-tertiary)] sm:inline">
-                {duration}
-              </span>
-            ) : null}
-          </div>
-          <div className="mt-0.5 truncate text-[12px] leading-5 text-[var(--color-text-secondary)]">
-            {detail}
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function isAgentBackgroundTaskMessage(message: UIMessage): boolean {
-  if (message.type !== 'background_task') return false
-  if (
-    message.task.taskType === 'local_agent' ||
-    message.task.taskType === 'remote_agent' ||
-    message.task.taskType === 'dream'
-  ) {
-    return true
-  }
-  return /^Agent (?:(?:"[^"]+" )?(completed|was stopped)|(?:"[^"]+" )?failed(?::|$))/.test(
-    message.task.summary ?? '',
-  )
-}
-
-function getBackgroundTaskLabel(
-  taskType: string | undefined,
-  t: (key: TranslationKey, params?: Record<string, string | number>) => string,
-): string {
-  if (taskType === 'local_bash') return t('chat.backgroundTasks.command')
-  if (taskType === 'local_workflow') return t('chat.backgroundTasks.workflow')
-  return t('chat.backgroundTasks.task')
 }
 
 function SelectableChatMessage({
@@ -1015,7 +935,13 @@ export function buildRenderModel(
     if (msg.type === 'assistant_text' && !msg.content.trim()) {
       continue
     }
-    if (isAgentBackgroundTaskMessage(msg)) {
+    // Activity owns task lifecycle/status, including failures and stops. Keep
+    // the records for task details and trajectory, but do not turn internal
+    // wake-ups into conversation rows or split a contiguous tool activity run.
+    if (
+      msg.type === 'background_task' ||
+      (msg.type === 'system' && msg.backgroundContinueTaskIds !== undefined)
+    ) {
       continue
     }
 
@@ -1163,14 +1089,6 @@ export function buildRenderModel(
       }
     } else if (msg.type === 'thinking') {
       appendThinking(msg)
-    } else if (msg.type === 'background_task' && msg.task.status === 'completed') {
-      // The activity panel already lists every background task — agent-like ones
-      // under SubAgents, the rest under Background Tasks — with live status and a
-      // way into the full run. A card here repeating a finished one just buries
-      // the conversation under status reports, and a long team session emits
-      // dozens. Anything that did NOT finish cleanly still gets a card: a failure
-      // or a stop changes what the turn means, and the panel can be closed.
-      continue
     } else {
       flushGroup()
       items.push({ kind: 'message', message: msg })
@@ -1257,7 +1175,6 @@ function isTurnResponseMessage(message: UIMessage) {
     message.type === 'assistant_text' ||
     message.type === 'tool_use' ||
     message.type === 'tool_result' ||
-    (message.type === 'background_task' && !isAgentBackgroundTaskMessage(message)) ||
     message.type === 'error' ||
     message.type === 'task_summary'
   )
@@ -2608,6 +2525,7 @@ export function MessageList({
   const lastAutoScrollAtRef = useRef(0)
   const lastContentResizeFollowHeightRef = useRef<number | null>(null)
   const shouldAutoScrollRef = useRef(true)
+  const restoringBottomRef = useRef(false)
   const restoringScrollAnchorRef = useRef<SessionScrollAnchor | null>(null)
   const isProgrammaticScrollingRef = useRef(false)
   const ignoreProgrammaticScrollUntilRef = useRef(0)
@@ -2729,6 +2647,7 @@ export function MessageList({
 
   const scrollToBottom = useCallback(() => {
     restoringScrollAnchorRef.current = null
+    restoringBottomRef.current = true
     shouldAutoScrollRef.current = true
     isProgrammaticScrollingRef.current = true
     ignoreProgrammaticScrollUntilRef.current = performance.now() + 250
@@ -2791,6 +2710,16 @@ export function MessageList({
     })
   }, [resolvedSessionId])
 
+  const releaseBottomRestoration = useCallback(() => {
+    restoringBottomRef.current = false
+    // A reader action can arrive between ResizeObserver and its queued frame.
+    // Cancel only idle restoration; live output keeps its existing follow rules.
+    if (!shouldFollowContentResize && liveFollowFrameRef.current !== null) {
+      cancelAnimationFrame(liveFollowFrameRef.current)
+      liveFollowFrameRef.current = null
+    }
+  }, [shouldFollowContentResize])
+
   const flushMeasuredHeightVersion = useCallback(() => {
     setMeasuredItemsVersion((version) => version + 1)
   }, [])
@@ -2807,7 +2736,7 @@ export function MessageList({
     // A row changing height while the reader follows the tail moves the bottom.
     // Re-pin whatever caused it (a permission card, a reloaded transcript
     // measuring in after the reply, a tool result settling), not only live
-    // output: the content-resize follow below is off once the chat is idle.
+    // output: content-resize follow is otherwise off in idle reading sessions.
     // Growth the reader just asked for by opening a block stays theirs (#1177).
     if (shouldAutoScrollRef.current && performance.now() >= disclosureLayoutUntilRef.current) {
       requestLiveFollow()
@@ -2848,12 +2777,13 @@ export function MessageList({
     }
     syncVirtualViewportFromContainer(container)
     const isAtBottom = isNearScrollBottom(container)
-    const isPermissionLayoutShift =
-      hasPendingPermissionCard &&
+    const isFollowingLayoutShift =
       shouldAutoScrollRef.current &&
       !isAtBottom &&
-      performance.now() >= userScrollIntentUntilRef.current
-    if (isPermissionLayoutShift) return
+      (restoringBottomRef.current || (
+        hasPendingPermissionCard && performance.now() >= userScrollIntentUntilRef.current
+      ))
+    if (isFollowingLayoutShift) return
 
     shouldAutoScrollRef.current = isAtBottom
     setIsAwayFromLatest(!isAtBottom)
@@ -2879,6 +2809,7 @@ export function MessageList({
     const target = event.target
     if (!(target instanceof Element) || !target.closest(CHAT_DISCLOSURE_SELECTOR)) return
 
+    releaseBottomRestoration()
     restoringScrollAnchorRef.current = null
     disclosureLayoutUntilRef.current = performance.now() + DISCLOSURE_FOLLOW_SUPPRESS_MS
 
@@ -2897,12 +2828,13 @@ export function MessageList({
       setIsAwayFromLatest(!atBottom)
       syncVirtualViewportFromContainer(container)
     })
-  }, [syncVirtualViewportFromContainer])
+  }, [releaseBottomRestoration, syncVirtualViewportFromContainer])
 
   const markUserScrollIntent = useCallback(() => {
+    releaseBottomRestoration()
     restoringScrollAnchorRef.current = null
     userScrollIntentUntilRef.current = performance.now() + USER_SCROLL_INTENT_WINDOW_MS
-  }, [])
+  }, [releaseBottomRestoration])
 
   const handleWheelScrollIntent = useCallback((event: { deltaY: number }) => {
     markUserScrollIntent()
@@ -2937,6 +2869,7 @@ export function MessageList({
       const snapshot = resolvedSessionId ? sessionScrollSnapshots.get(resolvedSessionId) : undefined
       restoringScrollAnchorRef.current = snapshot?.wasAtBottom ? null : snapshot?.anchor ?? null
       shouldAutoScrollRef.current = snapshot?.wasAtBottom ?? true
+      restoringBottomRef.current = shouldAutoScrollRef.current
       lastSessionIdRef.current = resolvedSessionId
       setProgrammaticNavigationItemId(null)
       if (resolvedSessionId) getHeightsForSession(resolvedSessionId, appearanceSignature)
@@ -3052,7 +2985,16 @@ export function MessageList({
         }
         lastContentResizeFollowHeightRef.current = nextHeight
       }
-      if (!shouldFollowContentResize) return
+      if (restoringScrollAnchorRef.current) {
+        // Non-virtual rows can settle after the switch's layout effect too.
+        // Reapply the saved reading anchor before paint, as measured rows do.
+        flushSync(flushMeasuredHeightVersion)
+        return
+      }
+      // Short lists have no measured-row callback. Keep a restored tail pinned
+      // through late layout, until the reader interacts with the transcript.
+      // Idle disclosures can fetch more content long after their click frame.
+      if (!shouldFollowContentResize && !restoringBottomRef.current) return
       if (!shouldAutoScrollRef.current) return
       // The reader just opened something: the growth is theirs, not the model's.
       if (performance.now() < disclosureLayoutUntilRef.current) return
@@ -3061,7 +3003,7 @@ export function MessageList({
     observer.observe(content)
 
     return () => observer.disconnect()
-  }, [requestLiveFollow, shouldFollowContentResize])
+  }, [flushMeasuredHeightVersion, requestLiveFollow, shouldFollowContentResize])
 
   // Touch-H5 only: the visual-viewport fit (touchH5.ts) shrinks the scroll
   // container when the soft keyboard opens. If the user was reading the tail,
@@ -4179,6 +4121,12 @@ export function MessageList({
         className={`${CHAT_SCROLL_AREA_CLASS} h-full overflow-y-auto ${chatScrollPaddingClass}`}
       >
         <div
+          // A malformed/replayed history can contain duplicate row identities.
+          // React can leave those rows outside its tracked child list; replace
+          // the transcript as a unit on session changes so none can follow the
+          // user into another session. Keep the scroller outside this boundary
+          // so its outgoing scroll snapshot is still captured before the swap.
+          key={resolvedSessionId}
           ref={scrollContentRef}
           // The reading measure holds whether or not a right-hand panel is
           // open — `compact` only tightens padding. Dropping to `max-w-full`
@@ -4442,6 +4390,9 @@ export const MessageBlock = memo(function MessageBlock({
             isTurnOutputOwner={isTurnOutputOwner}
             turnCompletion={turnCompletion}
           />
+          {isCliApiErrorText(message.content) && (
+            <MagpieConnectionHint sessionId={sessionId} errorText={message.content} />
+          )}
         </SelectableChatMessage>
       )
     case 'thinking':
@@ -4535,6 +4486,7 @@ export const MessageBlock = memo(function MessageBlock({
               {message.message}
             </div>
           )}
+          <MagpieConnectionHint sessionId={sessionId} errorText={message.message} />
         </div>
       )
     }
@@ -4549,7 +4501,7 @@ export const MessageBlock = memo(function MessageBlock({
         ? <GoalContinuationDivider message={message} />
         : <GoalEventCard message={message} />
     case 'background_task':
-      return <BackgroundTaskEventCard message={message} />
+      return null
     case 'system':
       return (
         <div className="mb-3 text-center text-xs text-[var(--color-text-tertiary)]">

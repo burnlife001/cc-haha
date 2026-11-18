@@ -10,10 +10,12 @@
  */
 
 import { getOpenAIPolicyError } from '../../services/openaiAuth/policyError.js'
+import { INVALID_PROVIDER_KEY_HEADER, isInvalidSavedProviderKey } from '../../shared/providerCredentialError.js'
+import { inspectProviderUsageError } from '../../shared/providerUsageLimit.js'
 import { buildOpenaiEndpoint } from './openaiEndpoint.js'
 import { normalizeAnthropicBaseUrl } from '../../services/api/anthropicBaseUrl.js'
 import { buildProviderMediaFetch } from '../../services/api/providerMedia/fetch.js'
-import { createGunzip, createInflate } from 'node:zlib'
+import { brotliDecompressSync, createGunzip, createInflate, gunzipSync, inflateSync } from 'node:zlib'
 
 import { ProviderService } from '../services/providerService.js'
 import { diagnosticsService } from '../services/diagnosticsService.js'
@@ -64,6 +66,23 @@ import { resolveModelApiBaseUrl, resolveModelApiRule } from '../../shared/modelA
 import { applyUpstreamHeaders, resolveUpstreamHeaders } from './upstreamHeaders.js'
 
 const providerService = new ProviderService()
+const MAX_CREDENTIAL_ERROR_BYTES = 64_000
+
+function formatUpstreamErrorMessage(status: number, text: string): string {
+  let detail = text.slice(0, 500)
+  if (status === 401 || status === 403 || status === 429) {
+    try {
+      const payload = JSON.parse(text)
+      const classification = inspectProviderUsageError(payload)
+      // A quota or credential code can occur after the message. Preserve the
+      // envelope so the CLI sees both it and the provider's own words.
+      if (text.length <= 64_000 || classification.usageLimit || classification.invalidCredential || isInvalidSavedProviderKey(status, payload)) detail = text
+    } catch {
+      // Unstructured upstream failures retain the bounded diagnostic text.
+    }
+  }
+  return `Upstream returned HTTP ${status}: ${detail}`
+}
 
 type ProxyFetchOptions = ReturnType<typeof getProxyFetchOptions>
 // `decompress` is a Bun fetch option absent from the DOM RequestInit type.
@@ -100,19 +119,32 @@ function wasTraceErrorRecorded(error: unknown): boolean {
   return Boolean(error && typeof error === 'object' && (error as Record<symbol, unknown>)[TRACE_RECORDED_ERROR_MARKER])
 }
 
-function createTimeoutController(timeoutMs: number): {
-  signal: AbortSignal
-  clear: () => void
-} {
-  const controller = new AbortController()
-  const timer = setTimeout(() => {
-    controller.abort(new DOMException('The operation timed out.', 'TimeoutError'))
-  }, timeoutMs)
+const CLIENT_CLOSED_REQUEST_STATUS = 499
 
-  return {
-    signal: controller.signal,
-    clear: () => clearTimeout(timer),
+function isAbortLikeError(error: unknown): boolean {
+  return (
+    (error instanceof Error || (typeof DOMException !== 'undefined' && error instanceof DOMException)) &&
+    (error.name === 'AbortError' || error.name === 'TimeoutError')
+  )
+}
+
+function toAbortError(reason?: unknown, fallbackMessage = 'The operation was aborted.'): Error {
+  if (reason instanceof Error) {
+    if (reason.name === 'Error') {
+      const wrapped = new Error(reason.message)
+      wrapped.name = 'AbortError'
+      return wrapped
+    }
+    return reason
   }
+  const message = reason !== undefined ? String(reason) : fallbackMessage
+  return new DOMException(message, 'AbortError')
+}
+
+type UpstreamFetchLease = {
+  response: Response
+  abortUpstream: (reason?: unknown) => void
+  dispose: () => void
 }
 
 async function fetchUpstreamWithTimeout(
@@ -121,7 +153,8 @@ async function fetchUpstreamWithTimeout(
   timeoutMs: number,
   isStream: boolean,
   onRequest?: (body: string, headers: Headers) => void,
-): Promise<Response> {
+  downstreamSignal?: AbortSignal,
+): Promise<UpstreamFetchLease> {
   // Convert media only after the protocol transform and final authentication.
   // Observe inference sends (including recovery), never multipart uploads, so
   // completion traces describe the actual upstream request.
@@ -133,31 +166,96 @@ async function fetchUpstreamWithTimeout(
     return fetch(input, requestInit)
   }) as typeof fetch)
   if (!isStream) {
-    return mediaFetch(url, {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs)
+    const signal = downstreamSignal
+      ? AbortSignal.any([timeoutSignal, downstreamSignal])
+      : timeoutSignal
+    const response = await mediaFetch(url, {
       ...init,
-      signal: AbortSignal.timeout(timeoutMs),
+      signal,
     })
+    return {
+      response,
+      abortUpstream: () => {},
+      dispose: () => {},
+    }
   }
 
-  // For streaming requests, this timeout should only cover the connection and
-  // response headers. Keeping the signal alive aborts long generations mid-body.
-  const timeout = createTimeoutController(timeoutMs)
-  try {
-    return await mediaFetch(url, {
-      ...init,
-      signal: timeout.signal,
-    })
-  } finally {
-    timeout.clear()
+  // For streaming requests, the timeout only covers the connection and response
+  // headers so long generations are not killed mid-body — while the downstream
+  // client's abort signal stays linked until the stream finishes or cancels so
+  // Bun closes the upstream socket immediately on user Stop (#1917).
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+    timer = null
+    controller.abort(new DOMException('The operation timed out.', 'TimeoutError'))
+  }, timeoutMs)
+
+  const clearConnectTimeout = () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
   }
+
+  const onDownstreamAbort = () => {
+    clearConnectTimeout()
+    if (!controller.signal.aborted) {
+      controller.abort(toAbortError(downstreamSignal?.reason))
+    }
+  }
+
+  if (downstreamSignal?.aborted) {
+    onDownstreamAbort()
+  } else if (downstreamSignal) {
+    downstreamSignal.addEventListener('abort', onDownstreamAbort, { once: true })
+  }
+
+  const dispose = () => {
+    clearConnectTimeout()
+    if (downstreamSignal) {
+      downstreamSignal.removeEventListener('abort', onDownstreamAbort)
+    }
+  }
+
+  const abortUpstream = (reason?: unknown) => {
+    dispose()
+    if (!controller.signal.aborted) {
+      controller.abort(toAbortError(reason))
+    }
+  }
+
+  try {
+    const response = await mediaFetch(url, {
+      ...init,
+      signal: controller.signal,
+    })
+    clearConnectTimeout()
+    return {
+      response,
+      abortUpstream,
+      dispose,
+    }
+  } catch (err) {
+    dispose()
+    throw err
+  }
+}
+
+export type StreamIdleTimeoutOptions = {
+  downstreamSignal?: AbortSignal
+  onAbortUpstream?: (reason?: unknown) => void
+  onCleanup?: () => void
 }
 
 export function withStreamIdleTimeout(
   upstream: ReadableStream<Uint8Array>,
   timeoutMs: number,
+  options?: StreamIdleTimeoutOptions,
 ): ReadableStream<Uint8Array> {
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
   let timer: ReturnType<typeof setTimeout> | null = null
+  let cleanedUp = false
 
   const clearIdleTimer = () => {
     if (timer) {
@@ -166,17 +264,65 @@ export function withStreamIdleTimeout(
     }
   }
 
+  const cleanup = () => {
+    if (cleanedUp) return
+    cleanedUp = true
+    clearIdleTimer()
+    if (options?.downstreamSignal && onDownstreamAbort) {
+      options.downstreamSignal.removeEventListener('abort', onDownstreamAbort)
+    }
+    options?.onCleanup?.()
+  }
+
+  let onDownstreamAbort: (() => void) | null = null
+  let streamCancelled = false
+
   return new ReadableStream({
     async start(controller) {
       reader = upstream.getReader()
       let timedOut = false
+      let abortedDownstream = false
+
+      if (options?.downstreamSignal) {
+        onDownstreamAbort = () => {
+          if (abortedDownstream || timedOut || streamCancelled) return
+          abortedDownstream = true
+          clearIdleTimer()
+          const abortErr = toAbortError(options.downstreamSignal?.reason)
+          options.onAbortUpstream?.(abortErr)
+          cleanup()
+          void reader?.cancel(abortErr).catch(() => undefined)
+          // Defer controller.error by one microtask: when served by Bun.serve,
+          // Bun dispatches req.signal 'abort' and then synchronously cancels
+          // Response.body in the same turn; erroring the stream before that
+          // synchronous cancel surfaces an uncaught exception from Bun's HTTP sink.
+          queueMicrotask(() => {
+            if (streamCancelled) return
+            try {
+              controller.error(abortErr)
+            } catch {
+              // Stream may already be closed or cancelled.
+            }
+          })
+        }
+        if (options.downstreamSignal.aborted) {
+          onDownstreamAbort()
+          reader?.releaseLock()
+          reader = null
+          return
+        }
+        options.downstreamSignal.addEventListener('abort', onDownstreamAbort, { once: true })
+      }
 
       const armIdleTimer = () => {
         clearIdleTimer()
         timer = setTimeout(() => {
           timedOut = true
+          const timeoutError = new Error(`Upstream stream idle timeout after ${timeoutMs}ms`)
+          options?.onAbortUpstream?.(timeoutError)
+          cleanup()
           void reader?.cancel('stream idle timeout').catch(() => undefined)
-          controller.error(new Error(`Upstream stream idle timeout after ${timeoutMs}ms`))
+          controller.error(timeoutError)
         }, timeoutMs)
       }
 
@@ -185,23 +331,25 @@ export function withStreamIdleTimeout(
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
-          if (timedOut) break
+          if (timedOut || abortedDownstream) break
 
           controller.enqueue(value)
           armIdleTimer()
         }
-        clearIdleTimer()
-        if (!timedOut) controller.close()
+        cleanup()
+        if (!timedOut && !abortedDownstream) controller.close()
       } catch (err) {
-        clearIdleTimer()
-        if (!timedOut) controller.error(err)
+        cleanup()
+        if (!timedOut && !abortedDownstream) controller.error(err)
       } finally {
         reader?.releaseLock()
         reader = null
       }
     },
     cancel(reason) {
-      clearIdleTimer()
+      streamCancelled = true
+      options?.onAbortUpstream?.(reason)
+      cleanup()
       return reader?.cancel(reason)
     },
   })
@@ -246,6 +394,9 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
   try {
     body = (await req.json()) as AnthropicRequest
   } catch {
+    if (req.signal.aborted) {
+      return new Response(null, { status: CLIENT_CLOSED_REQUEST_STATUS })
+    }
     return Response.json(
       { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON in request body' } },
       { status: 400 },
@@ -308,15 +459,15 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
         resolvedApiFormat: apiFormat,
         supportsNestedToolResultMedia: config.supportsNestedToolResultMedia,
       })
-      return await handleAnthropicCompatible(body, upstreamBaseUrl, config.apiKey, config.authStrategy, req.headers, isStream, networkSettings, traceContext, upstreamHeaders, hoistNestedMedia)
+      return await handleAnthropicCompatible(body, upstreamBaseUrl, config.apiKey, config.authStrategy, req.headers, isStream, networkSettings, traceContext, upstreamHeaders, hoistNestedMedia, req.signal)
     }
     if (apiFormat === 'gemini') {
-      return await handleGemini(body, upstreamBaseUrl, config.apiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders)
+      return await handleGemini(body, upstreamBaseUrl, config.apiKey, config.authStrategy === 'api_key', isStream, networkSettings, traceContext, requestOptions, upstreamHeaders, req.signal)
     }
     if (apiFormat === 'openai_chat') {
-      return await handleOpenaiChat(body, upstreamBaseUrl, config.apiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders)
+      return await handleOpenaiChat(body, upstreamBaseUrl, config.apiKey, config.authStrategy === 'api_key', isStream, networkSettings, traceContext, requestOptions, upstreamHeaders, undefined, new Set(), req.signal)
     }
-    return await handleOpenaiResponses(body, upstreamBaseUrl, config.apiKey, isStream, networkSettings, traceContext, promptCacheKey, requestOptions, upstreamHeaders)
+    return await handleOpenaiResponses(body, upstreamBaseUrl, config.apiKey, config.authStrategy === 'api_key', isStream, networkSettings, traceContext, promptCacheKey, requestOptions, upstreamHeaders, req.signal)
   } catch (err) {
     if (traceContext && !wasTraceErrorRecorded(err) && !recordedTraceErrorContexts.has(traceContext)) {
       void recordProxyTrace({
@@ -328,6 +479,9 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
         startedAtMs: Date.now(),
         error: err,
       }).catch(() => {})
+    }
+    if (req.signal.aborted) {
+      return new Response(null, { status: CLIENT_CLOSED_REQUEST_STATUS })
     }
     console.error('[Proxy] Upstream request failed:', err)
     const policyError = getOpenAIPolicyError(err)
@@ -482,9 +636,23 @@ function stripHopByHopHeaders(headers: Headers): Headers {
   const deny = hopByHopDenySet(headers)
   const stripped = new Headers()
   for (const [name, value] of headers.entries()) {
-    if (!deny.has(name.toLowerCase())) stripped.set(name, value)
+    // This assertion is reserved for the local proxy, not the upstream.
+    if (!deny.has(name.toLowerCase()) && name.toLowerCase() !== INVALID_PROVIDER_KEY_HEADER) stripped.set(name, value)
   }
   return stripped
+}
+
+function decodeCredentialError(bytes: ArrayBuffer, headers: Headers): unknown {
+  if (bytes.byteLength > MAX_CREDENTIAL_ERROR_BYTES) return null
+  const input = Buffer.from(bytes)
+  const encoding = (headers.get('content-encoding') ?? '').trim().toLowerCase()
+  const options = { maxOutputLength: MAX_CREDENTIAL_ERROR_BYTES }
+  const decoded = encoding === 'gzip' || encoding === 'x-gzip' ? gunzipSync(input, options)
+    : encoding === 'deflate' ? inflateSync(input, options)
+      : encoding === 'br' ? brotliDecompressSync(input, options)
+        : encoding === '' || encoding === 'identity' ? input : null
+  if (!decoded || decoded.byteLength > MAX_CREDENTIAL_ERROR_BYTES) return null
+  return JSON.parse(decoded.toString('utf8'))
 }
 
 /**
@@ -505,6 +673,7 @@ async function handleAnthropicCompatible(
   traceContext: ProxyTraceContext | null,
   upstreamHeaders: Record<string, string> = {},
   hoistNestedMedia = true,
+  downstreamSignal?: AbortSignal,
 ): Promise<Response> {
   // The media hoist is a compatibility rewrite for endpoints that drop media
   // nested in tool_result. A native Messages endpoint accepts it unchanged, so it
@@ -581,11 +750,11 @@ async function handleAnthropicCompatible(
     recordedTraceErrorContexts.add(traceContext)
   }
 
-  let upstream: Response
+  let upstreamLease: UpstreamFetchLease
   try {
     const initialRequest = transformed
     const serialized = JSON.stringify(initialRequest)
-    upstream = await fetchUpstreamWithTimeout(url, {
+    upstreamLease = await fetchUpstreamWithTimeout(url, {
       method: 'POST',
       headers,
       body: serialized,
@@ -600,9 +769,12 @@ async function handleAnthropicCompatible(
       const beta = sentHeaders.get('anthropic-beta')
       if (beta) traceHeaders['anthropic-beta'] = beta
       else delete traceHeaders['anthropic-beta']
-    })
+    }, downstreamSignal)
   } catch (err) {
     recordTraceError(err)
+    if (downstreamSignal?.aborted) {
+      return new Response(null, { status: CLIENT_CLOSED_REQUEST_STATUS })
+    }
     console.error('[Proxy] Upstream anthropic request failed:', err)
     return Response.json(
       {
@@ -615,15 +787,29 @@ async function handleAnthropicCompatible(
       { status: 502 },
     )
   }
+  const upstream = upstreamLease.response
 
   try {
     if (!upstream.ok) {
-      // Pass the upstream error body and headers through unchanged so the SDK
+      // Pass the upstream error body and protocol headers through so the SDK
       // keeps error classification (authentication_error, rate_limit_error, …),
       // request_id, and retry-after semantics. A body read failure here closes
       // the pending trace and surfaces to the caller's unified error handling
       // (structured 502) like any other upstream failure.
       const errBody = await upstream.arrayBuffer()
+      upstreamLease.dispose()
+      const responseHeaders = stripHopByHopHeaders(upstream.headers)
+      if (upstream.status === 401 && authStrategy === 'api_key') {
+        try {
+          const payload = decodeCredentialError(errBody, upstream.headers)
+          if (isInvalidSavedProviderKey(upstream.status, payload)) {
+            responseHeaders.set(INVALID_PROVIDER_KEY_HEADER, 'true')
+            responseHeaders.set('x-should-retry', 'false')
+          }
+        } catch {
+          // Unstructured or undecodable failures keep upstream retry semantics.
+        }
+      }
       if (traceContext) {
         recordProxyTraceInBackground({
           callId: traceCallId,
@@ -641,12 +827,13 @@ async function handleAnthropicCompatible(
       }
       return new Response(errBody, {
         status: upstream.status,
-        headers: stripHopByHopHeaders(upstream.headers),
+        headers: responseHeaders,
       })
     }
 
     if (isStream) {
       if (!upstream.body) {
+        upstreamLease.dispose()
         if (traceContext) {
           recordProxyTraceInBackground({
             callId: traceCallId,
@@ -671,7 +858,11 @@ async function handleAnthropicCompatible(
       responseHeaders.set('Content-Type', 'text/event-stream')
       responseHeaders.set('Cache-Control', 'no-cache')
       responseHeaders.set('Connection', 'keep-alive')
-      const anthropicStream = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs)
+      const anthropicStream = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs, {
+        downstreamSignal,
+        onAbortUpstream: upstreamLease.abortUpstream,
+        onCleanup: upstreamLease.dispose,
+      })
       const tracedStream = traceContext
         ? captureTraceStream(anthropicStream, async (bodySnapshot, error, protocolTraceEnd) => {
             await recordProxyTrace({
@@ -689,7 +880,7 @@ async function handleAnthropicCompatible(
               responseHeaders: upstream.headers,
               ...(error ? { error } : {}),
             })
-          }, upstream.headers.get('content-encoding') ?? undefined)
+          }, upstream.headers.get('content-encoding') ?? undefined, downstreamSignal)
         : anthropicStream
       return new Response(tracedStream, {
         status: 200,
@@ -700,6 +891,7 @@ async function handleAnthropicCompatible(
     // Byte-for-byte passthrough: re-serializing the body would invalidate
     // Content-Length/ETag entity headers from the upstream.
     const responseBody = await upstream.arrayBuffer()
+    upstreamLease.dispose()
     if (traceContext) {
       recordProxyTraceInBackground({
         callId: traceCallId,
@@ -720,6 +912,7 @@ async function handleAnthropicCompatible(
       headers: stripHopByHopHeaders(upstream.headers),
     })
   } catch (err) {
+    upstreamLease.dispose()
     // A body read failure closes the pending trace with the original call id
     // (so no trace stays pending and no second trace is created), then
     // rethrows so the caller returns the same structured 502 as any other
@@ -733,6 +926,7 @@ async function handleOpenaiChat(
   body: AnthropicRequest,
   baseUrl: string,
   apiKey: string,
+  isSavedApiKey: boolean,
   isStream: boolean,
   networkSettings: NetworkSettings,
   traceContext: ProxyTraceContext | null,
@@ -740,6 +934,7 @@ async function handleOpenaiChat(
   upstreamHeaders: Record<string, string> = {},
   imageContentModeOverride?: OpenAIChatImageContentMode,
   rejectedReasoningFields: ReadonlySet<OpenAIChatReasoningField> = new Set(),
+  downstreamSignal?: AbortSignal,
 ): Promise<Response> {
   const knownDeepSeekHost = shouldUseDeepSeekReasoningCompat(baseUrl)
   const reasoningProfile = resolveModelReasoningProfile(body.model, 'openai_chat')
@@ -780,18 +975,18 @@ async function handleOpenaiChat(
       })
     : undefined
 
-  let upstream: Response
+  let upstreamLease: UpstreamFetchLease
   try {
     const initialRequest = transformed
     const serialized = JSON.stringify(initialRequest)
-    upstream = await fetchUpstreamWithTimeout(url, {
+    upstreamLease = await fetchUpstreamWithTimeout(url, {
       method: 'POST',
       headers: upstreamRequestHeaders,
       body: serialized,
       ...proxyOptions,
     }, networkSettings.aiRequestTimeoutMs, isStream, sentBody => {
       transformed = sentBody === serialized ? initialRequest : JSON.parse(sentBody)
-    })
+    }, downstreamSignal)
   } catch (err) {
     if (traceContext) {
       recordProxyTraceInBackground({
@@ -809,10 +1004,12 @@ async function handleOpenaiChat(
     }
     throw err
   }
+  const upstream = upstreamLease.response
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')
-    if (imageContentMode === 'vision' && isOpenAIChatImageRejection(upstream.status, errText, transformed)) {
+    upstreamLease.dispose()
+    if (!downstreamSignal?.aborted && imageContentMode === 'vision' && isOpenAIChatImageRejection(upstream.status, errText, transformed)) {
       // The upstream refused the request before generating anything, so the
       // client has seen no output and resending is safe. The model is only
       // remembered once the same request succeeds without images, so an
@@ -833,8 +1030,8 @@ async function handleOpenaiChat(
         })
       }
       const resent = await handleOpenaiChat(
-        body, baseUrl, apiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders, 'text_only',
-        unsupportedReasoningFields,
+        body, baseUrl, apiKey, isSavedApiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders, 'text_only',
+        unsupportedReasoningFields, downstreamSignal,
       )
       if (resent.ok) {
         rememberOpenAIChatTextOnlyModel(url, body.model)
@@ -848,7 +1045,7 @@ async function handleOpenaiChat(
       return resent
     }
     const rejectedField = findOpenAIChatReasoningFieldRejection(upstream.status, errText, transformed)
-    if (rejectedField && !unsupportedReasoningFields.has(rejectedField)) {
+    if (!downstreamSignal?.aborted && rejectedField && !unsupportedReasoningFields.has(rejectedField)) {
       // Same contract as the image fallback: the upstream refused the request
       // before generating anything, and the field is only remembered once the
       // resend without it succeeds.
@@ -868,8 +1065,8 @@ async function handleOpenaiChat(
         })
       }
       const resent = await handleOpenaiChat(
-        body, baseUrl, apiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders,
-        imageContentMode, new Set([...unsupportedReasoningFields, rejectedField]),
+        body, baseUrl, apiKey, isSavedApiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders,
+        imageContentMode, new Set([...unsupportedReasoningFields, rejectedField]), downstreamSignal,
       )
       if (resent.ok) {
         rememberOpenAIChatUnsupportedReasoningField(url, body.model, rejectedField)
@@ -883,8 +1080,11 @@ async function handleOpenaiChat(
       return resent
     }
     let policyError = null
+    let invalidProviderKey = false
     try {
-      policyError = getOpenAIPolicyError(JSON.parse(errText))
+      const payload = JSON.parse(errText)
+      policyError = getOpenAIPolicyError(payload)
+      invalidProviderKey = isSavedApiKey && !policyError && isInvalidSavedProviderKey(upstream.status, payload)
     } catch {
       // Unstructured upstream failures keep their existing error classification.
     }
@@ -892,7 +1092,7 @@ async function handleOpenaiChat(
       type: 'error',
       error: policyError ? { type: 'permission_error', ...policyError } : {
         type: 'api_error',
-        message: `Upstream returned HTTP ${upstream.status}: ${errText.slice(0, 500)}`,
+        message: formatUpstreamErrorMessage(upstream.status, errText),
       },
     }
     if (traceContext) {
@@ -913,12 +1113,16 @@ async function handleOpenaiChat(
     }
     return Response.json(
       errorBody,
-      { status: policyError ? 403 : upstream.status },
+      {
+        status: policyError ? 403 : upstream.status,
+        ...(invalidProviderKey && { headers: { [INVALID_PROVIDER_KEY_HEADER]: 'true', 'x-should-retry': 'false' } }),
+      },
     )
   }
 
   if (isStream) {
     if (!upstream.body) {
+      upstreamLease.dispose()
       if (traceContext) {
         recordProxyTraceInBackground({
           callId: traceCallId,
@@ -937,9 +1141,13 @@ async function handleOpenaiChat(
         { status: 502 },
       )
     }
-    const upstreamBody = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs)
+    const upstreamBody = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs, {
+      downstreamSignal,
+      onAbortUpstream: upstreamLease.abortUpstream,
+      onCleanup: upstreamLease.dispose,
+    })
     const observedBody = traceContext?.protocolTrace
-      ? observeProtocolStream(upstreamBody, traceContext.protocolTrace) : upstreamBody
+      ? observeProtocolStream(upstreamBody, traceContext.protocolTrace, downstreamSignal) : upstreamBody
     const anthropicStream = openaiChatStreamToAnthropic(observedBody, body.model)
     const tracedStream = traceContext
       ? captureTraceStream(anthropicStream, async (bodySnapshot, error, protocolTraceEnd) => {
@@ -958,7 +1166,7 @@ async function handleOpenaiChat(
             responseHeaders: upstream.headers,
             ...(error ? { error } : {}),
           })
-        })
+        }, undefined, downstreamSignal)
       : anthropicStream
     return new Response(tracedStream, {
       status: 200,
@@ -971,7 +1179,28 @@ async function handleOpenaiChat(
   }
 
   // Non-streaming
-  const responseBody = await upstream.json()
+  let responseBody: any
+  try {
+    responseBody = await upstream.json()
+  } catch (err) {
+    if (traceContext) {
+      recordProxyTraceInBackground({
+        callId: traceCallId,
+        context: traceContext,
+        model: body.model,
+        upstreamUrl: url,
+        upstreamRequest: transformed,
+        requestHeaders: upstreamRequestHeaders,
+        startedAt,
+        startedAtMs,
+        error: err,
+      })
+      markTraceErrorRecorded(err)
+    }
+    throw err
+  } finally {
+    upstreamLease.dispose()
+  }
   const policyError = getOpenAIPolicyError(responseBody)
   const anthropicResponse = policyError
     ? { type: 'error', error: { type: 'permission_error', ...policyError } }
@@ -1006,12 +1235,14 @@ async function handleOpenaiResponses(
   body: AnthropicRequest,
   baseUrl: string,
   apiKey: string,
+  isSavedApiKey: boolean,
   isStream: boolean,
   networkSettings: NetworkSettings,
   traceContext: ProxyTraceContext | null,
   promptCacheKey?: string,
   requestOptions: RequestCompatibilityOptions = {},
   upstreamHeaders: Record<string, string> = {},
+  downstreamSignal?: AbortSignal,
 ): Promise<Response> {
   let transformed = anthropicToOpenaiResponses(body, { ...requestOptions, cacheKey: promptCacheKey })
   if (traceContext) {
@@ -1039,18 +1270,18 @@ async function handleOpenaiResponses(
       })
     : undefined
 
-  let upstream: Response
+  let upstreamLease: UpstreamFetchLease
   try {
     const initialRequest = transformed
     const serialized = JSON.stringify(initialRequest)
-    upstream = await fetchUpstreamWithTimeout(url, {
+    upstreamLease = await fetchUpstreamWithTimeout(url, {
       method: 'POST',
       headers: upstreamRequestHeaders,
       body: serialized,
       ...proxyOptions,
     }, networkSettings.aiRequestTimeoutMs, isStream, sentBody => {
       transformed = sentBody === serialized ? initialRequest : JSON.parse(sentBody)
-    })
+    }, downstreamSignal)
   } catch (err) {
     if (traceContext) {
       recordProxyTraceInBackground({
@@ -1068,12 +1299,17 @@ async function handleOpenaiResponses(
     }
     throw err
   }
+  const upstream = upstreamLease.response
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')
+    upstreamLease.dispose()
     let policyError = null
+    let invalidProviderKey = false
     try {
-      policyError = getOpenAIPolicyError(JSON.parse(errText))
+      const payload = JSON.parse(errText)
+      policyError = getOpenAIPolicyError(payload)
+      invalidProviderKey = isSavedApiKey && !policyError && isInvalidSavedProviderKey(upstream.status, payload)
     } catch {
       // Unstructured upstream failures keep their existing error classification.
     }
@@ -1081,7 +1317,7 @@ async function handleOpenaiResponses(
       type: 'error',
       error: policyError ? { type: 'permission_error', ...policyError } : {
         type: 'api_error',
-        message: `Upstream returned HTTP ${upstream.status}: ${errText.slice(0, 500)}`,
+        message: formatUpstreamErrorMessage(upstream.status, errText),
       },
     }
     if (traceContext) {
@@ -1102,12 +1338,16 @@ async function handleOpenaiResponses(
     }
     return Response.json(
       errorBody,
-      { status: policyError ? 403 : upstream.status },
+      {
+        status: policyError ? 403 : upstream.status,
+        ...(invalidProviderKey && { headers: { [INVALID_PROVIDER_KEY_HEADER]: 'true', 'x-should-retry': 'false' } }),
+      },
     )
   }
 
   if (isStream) {
     if (!upstream.body) {
+      upstreamLease.dispose()
       if (traceContext) {
         recordProxyTraceInBackground({
           callId: traceCallId,
@@ -1126,9 +1366,13 @@ async function handleOpenaiResponses(
         { status: 502 },
       )
     }
-    const upstreamBody = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs)
+    const upstreamBody = withStreamIdleTimeout(upstream.body, networkSettings.aiRequestTimeoutMs, {
+      downstreamSignal,
+      onAbortUpstream: upstreamLease.abortUpstream,
+      onCleanup: upstreamLease.dispose,
+    })
     const observedBody = traceContext?.protocolTrace
-      ? observeProtocolStream(upstreamBody, traceContext.protocolTrace) : upstreamBody
+      ? observeProtocolStream(upstreamBody, traceContext.protocolTrace, downstreamSignal) : upstreamBody
     const anthropicStream = openaiResponsesStreamToAnthropic(observedBody, body.model)
     const tracedStream = traceContext
       ? captureTraceStream(anthropicStream, async (bodySnapshot, error, protocolTraceEnd) => {
@@ -1147,7 +1391,7 @@ async function handleOpenaiResponses(
             responseHeaders: upstream.headers,
             ...(error ? { error } : {}),
           })
-        })
+        }, undefined, downstreamSignal)
       : anthropicStream
     return new Response(tracedStream, {
       status: 200,
@@ -1160,7 +1404,28 @@ async function handleOpenaiResponses(
   }
 
   // Non-streaming
-  const responseBody = await upstream.json()
+  let responseBody: any
+  try {
+    responseBody = await upstream.json()
+  } catch (err) {
+    if (traceContext) {
+      recordProxyTraceInBackground({
+        callId: traceCallId,
+        context: traceContext,
+        model: body.model,
+        upstreamUrl: url,
+        upstreamRequest: transformed,
+        requestHeaders: upstreamRequestHeaders,
+        startedAt,
+        startedAtMs,
+        error: err,
+      })
+      markTraceErrorRecorded(err)
+    }
+    throw err
+  } finally {
+    upstreamLease.dispose()
+  }
   const policyError = getOpenAIPolicyError(responseBody)
   const anthropicResponse = policyError
     ? { type: 'error', error: { type: 'permission_error', ...policyError } }
@@ -1193,11 +1458,13 @@ async function handleGemini(
   body: AnthropicRequest,
   baseUrl: string,
   apiKey: string,
+  isSavedApiKey: boolean,
   isStream: boolean,
   networkSettings: NetworkSettings,
   traceContext: ProxyTraceContext | null,
   requestOptions: RequestCompatibilityOptions = {},
   upstreamHeaders: Record<string, string> = {},
+  downstreamSignal?: AbortSignal,
 ): Promise<Response> {
   const transformed = anthropicToGemini(body, requestOptions)
   const model = encodeURIComponent(body.model)
@@ -1215,7 +1482,7 @@ async function handleGemini(
     headers: upstreamRequestHeaders,
     body: JSON.stringify(request),
     ...proxyOptions,
-  }, networkSettings.aiRequestTimeoutMs, isStream)
+  }, networkSettings.aiRequestTimeoutMs, isStream, undefined, downstreamSignal)
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
   const traceCallId = traceContext
@@ -1243,20 +1510,30 @@ async function handleGemini(
     })
   }
 
-  let upstream: Response
+  let upstreamLease: UpstreamFetchLease
   try {
-    upstream = await send(transformed)
+    upstreamLease = await send(transformed)
   } catch (err) {
     trace({ error: err })
     if (traceContext) markTraceErrorRecorded(err)
     throw err
   }
+  const upstream = upstreamLease.response
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')
+    upstreamLease.dispose()
+    let invalidProviderKey = false
+    if (isSavedApiKey && upstream.status === 401 && errText.length <= MAX_CREDENTIAL_ERROR_BYTES) {
+      try {
+        invalidProviderKey = isInvalidSavedProviderKey(upstream.status, JSON.parse(errText))
+      } catch {
+        // Unstructured upstream failures keep their existing retry behavior.
+      }
+    }
     const errorBody = {
       type: 'error',
-      error: { type: 'api_error', message: `Upstream returned HTTP ${upstream.status}: ${errText.slice(0, 500)}` },
+      error: { type: 'api_error', message: invalidProviderKey ? formatUpstreamErrorMessage(upstream.status, errText) : `Upstream returned HTTP ${upstream.status}: ${errText.slice(0, 500)}` },
     }
     trace({
       responseStatus: upstream.status,
@@ -1264,14 +1541,18 @@ async function handleGemini(
       anthropicResponseBody: errorBody,
       responseHeaders: upstream.headers,
     })
-    return Response.json(errorBody, { status: upstream.status })
+    return Response.json(errorBody, {
+      status: upstream.status,
+      ...(invalidProviderKey && { headers: { [INVALID_PROVIDER_KEY_HEADER]: 'true', 'x-should-retry': 'false' } }),
+    })
   }
 
   // Only the first request is traced; continuations carry the same body plus a token.
-  const resend = async (continuationToken: string): Promise<Response> => {
-    const response = await send({ ...transformed, continuationToken })
-    if (response.ok) return response
-    const errText = await response.text().catch(() => '')
+  const resend = async (continuationToken: string): Promise<UpstreamFetchLease> => {
+    const lease = await send({ ...transformed, continuationToken })
+    if (lease.response.ok) return lease
+    const errText = await lease.response.text().catch(() => '')
+    lease.dispose()
     let message: string | undefined
     try {
       message = geminiErrorMessage(JSON.parse(errText))
@@ -1279,24 +1560,33 @@ async function handleGemini(
       // An unstructured failure keeps its raw text below.
     }
     throw new GeminiUpstreamError(
-      `Gemini continuation returned HTTP ${response.status}: ${(message ?? errText).slice(0, 500)}`,
-      response.status,
+      `Gemini continuation returned HTTP ${lease.response.status}: ${(message ?? errText).slice(0, 500)}`,
+      lease.response.status,
     )
   }
 
   if (isStream) {
     if (!upstream.body) {
+      upstreamLease.dispose()
       trace({ error: new Error('Upstream returned no body for stream') })
       return Response.json(
         { type: 'error', error: { type: 'api_error', message: 'Upstream returned no body for stream' } },
         { status: 502 },
       )
     }
-    const idle = (stream: ReadableStream<Uint8Array>) => withStreamIdleTimeout(stream, networkSettings.aiRequestTimeoutMs)
-    const anthropicStream = geminiStreamToAnthropic(idle(upstream.body), body.model, async (token) => {
-      const response = await resend(token)
-      if (!response.body) throw new GeminiUpstreamError('Gemini continuation returned no body for stream')
-      return idle(response.body)
+    const idle = (lease: UpstreamFetchLease) =>
+      withStreamIdleTimeout(lease.response.body!, networkSettings.aiRequestTimeoutMs, {
+        downstreamSignal,
+        onAbortUpstream: lease.abortUpstream,
+        onCleanup: lease.dispose,
+      })
+    const anthropicStream = geminiStreamToAnthropic(idle(upstreamLease), body.model, async (token) => {
+      const lease = await resend(token)
+      if (!lease.response.body) {
+        lease.dispose()
+        throw new GeminiUpstreamError('Gemini continuation returned no body for stream')
+      }
+      return idle(lease)
     })
     const tracedStream = traceContext
       ? captureTraceStream(anthropicStream, async (bodySnapshot, error, protocolTraceEnd) => {
@@ -1315,7 +1605,7 @@ async function handleGemini(
             responseHeaders: upstream.headers,
             ...(error ? { error } : {}),
           })
-        })
+        }, undefined, downstreamSignal)
       : anthropicStream
     return new Response(tracedStream, {
       status: 200,
@@ -1328,14 +1618,30 @@ async function handleGemini(
   }
 
   // Non-streaming
-  const responseBody = await upstream.json()
+  let responseBody: any
+  try {
+    responseBody = await upstream.json()
+  } catch (err) {
+    trace({ error: err })
+    if (traceContext) markTraceErrorRecorded(err)
+    throw err
+  } finally {
+    upstreamLease.dispose()
+  }
   let anthropicResponse: unknown
   let status = 200
   try {
     anthropicResponse = await geminiResponseToAnthropic(
       responseBody,
       body.model,
-      async token => (await resend(token)).json(),
+      async token => {
+        const lease = await resend(token)
+        try {
+          return await lease.response.json()
+        } finally {
+          lease.dispose()
+        }
+      },
     )
   } catch (err) {
     if (!(err instanceof GeminiUpstreamError)) throw err
@@ -1498,6 +1804,8 @@ async function recordProxyTrace({
     }
   }
 
+  const aborted = protocolTraceEnd === 'cancelled' || isAbortLikeError(error)
+
   await traceCaptureService.recordCall({
     ...(callId ? { id: callId } : {}),
     sessionId: context.sessionId,
@@ -1525,6 +1833,7 @@ async function recordProxyTrace({
     ...(error ? { error } : {}),
     metadata: {
       phase: error ? 'upstream_fetch_failed' : 'upstream_fetch_completed',
+      ...(aborted ? { aborted: true } : {}),
       ...(observer ? {
         protocolTrace: {
           ...observer.snapshot(),
@@ -1547,6 +1856,7 @@ async function recordProxyTrace({
     metadata: {
       status: responseStatus,
       url: upstreamUrl,
+      ...(aborted ? { aborted: true } : {}),
     },
   })
 }
@@ -1555,6 +1865,7 @@ function captureTraceStream(
   stream: ReadableStream<Uint8Array>,
   onComplete: (snapshot: TraceBodySnapshot, error?: unknown, end?: Exclude<ProtocolTraceTransport, 'open'>) => Promise<void>,
   contentEncoding?: string,
+  downstreamSignal?: AbortSignal,
 ): ReadableStream<Uint8Array> {
   // The Anthropic passthrough forwards raw upstream bytes (`decompress:
   // false`), so a compressed SSE body would otherwise be stored as binary
@@ -1683,13 +1994,65 @@ function captureTraceStream(
     await decompressEnded
   }
 
+  let streamCancelled = false
+  let abortPromise: Promise<void> | null = null
+
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       reader = stream.getReader()
+      const abortFromDownstream = (): Promise<void> => {
+        if (!abortPromise) {
+          abortPromise = (async () => {
+            activelyEnded = true
+            const abortError = toAbortError(downstreamSignal?.reason, 'Stream cancelled')
+            // Defer controller.error by one microtask so Bun.serve's synchronous
+            // post-abort Response.body.cancel() can mark streamCancelled first
+            // without triggering an uncaught HTTP sink error, while direct
+            // Response.body readers without reader.cancel() still reject on the
+            // next microtask.
+            queueMicrotask(() => {
+              if (streamCancelled) return
+              try {
+                controller.error(abortError)
+              } catch {
+                // Stream may already be closed, cancelled, or errored.
+              }
+            })
+            const cancelPromise = reader?.cancel(abortError).catch(() => undefined)
+            await finishDecompressor()
+            void finalize(abortError, 'cancelled')
+            await cancelPromise
+          })()
+        }
+        return abortPromise
+      }
+      const onDownstreamAbort = () => {
+        if (streamCancelled || finalized) return
+        void abortFromDownstream()
+      }
+      if (downstreamSignal?.aborted) {
+        await abortFromDownstream()
+        try {
+          reader?.releaseLock()
+        } catch {
+          // Reader lock may already be released.
+        }
+        reader = null
+        return
+      }
+      downstreamSignal?.addEventListener('abort', onDownstreamAbort, { once: true })
       try {
-        while (true) {
+        while (!streamCancelled) {
+          if (downstreamSignal?.aborted) {
+            await abortFromDownstream()
+            return
+          }
           const { done, value } = await reader.read()
-          if (done) break
+          if (downstreamSignal?.aborted) {
+            await abortFromDownstream()
+            return
+          }
+          if (streamCancelled || done) break
           controller.enqueue(value)
           if (decompressor) {
             if (!decompressorFailed && !decompressorEnded) {
@@ -1710,23 +2073,49 @@ function captureTraceStream(
             captureDecoded(value)
           }
         }
+        if (downstreamSignal?.aborted) {
+          await abortFromDownstream()
+          return
+        }
+        if (streamCancelled) return
         controller.close()
         await finishDecompressor()
         void finalize()
       } catch (err) {
-        controller.error(err)
+        if (downstreamSignal?.aborted) {
+          await abortFromDownstream()
+          return
+        }
+        if (streamCancelled) return
+        try {
+          controller.error(err)
+        } catch {
+          // Stream may already be closed or errored.
+        }
         activelyEnded = true
         await finishDecompressor()
         void finalize(err, 'error')
       } finally {
-        reader?.releaseLock()
+        if (downstreamSignal) {
+          downstreamSignal.removeEventListener('abort', onDownstreamAbort)
+        }
+        try {
+          reader?.releaseLock()
+        } catch {
+          // Reader lock may already be released.
+        }
         reader = null
       }
     },
     async cancel(reason) {
+      streamCancelled = true
+      if (abortPromise) {
+        await abortPromise
+        return
+      }
       const error = reason instanceof Error
-        ? reason
-        : new Error(reason ? `Stream cancelled: ${String(reason)}` : 'Stream cancelled')
+        ? toAbortError(reason)
+        : new DOMException(reason ? `Stream cancelled: ${String(reason)}` : 'Stream cancelled', 'AbortError')
       activelyEnded = true
       await finishDecompressor()
       void finalize(error, 'cancelled')

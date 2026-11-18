@@ -39,7 +39,9 @@ import {
 } from '../../utils/tasks.js'
 import type { TaskListLifecycleState } from '../../utils/tasks.js'
 import { cleanupTeamDirectories } from '../../utils/swarm/teamHelpers.js'
+import { parseMemberCommand, unsupportedMemberCommandReason } from '../../utils/swarm/memberCommand.js'
 import type { TaskInfo } from './taskService.js'
+import { powerActivityClock } from './powerActivityClock.js'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -149,6 +151,7 @@ export type TranscriptMessage = {
    * tool call to its stringified body.
    */
   toolUseResult?: unknown
+  durationMs?: number
 }
 
 export type TeamTranscriptPage = {
@@ -1451,6 +1454,7 @@ export class TeamService {
   private readonly localIndexGateway: LocalIndexGateway
   private readonly targetedEntryReader: typeof readSessionEntriesByLocator
   private readonly archiveWriteLocks = new Map<string, Promise<unknown>>()
+  private pendingMemberMessages = 0
 
   constructor(options: {
     sessionLocator?: Pick<typeof sessionService, 'findSessionFile'>
@@ -1793,6 +1797,10 @@ export class TeamService {
     return this.parseTranscriptFilePage(transcriptPath, options, projection)
   }
 
+  hasPendingMemberMessages(): boolean {
+    return this.pendingMemberMessages > 0
+  }
+
   async sendMemberMessage(
     teamName: string,
     agentId: string,
@@ -1802,7 +1810,25 @@ export class TeamService {
     if (!text) {
       throw ApiError.badRequest('content (string) is required in request body')
     }
+    const command = parseMemberCommand(text)
+    const unsupported = command && unsupportedMemberCommandReason(command)
+    if (unsupported) {
+      throw new ApiError(400, unsupported, 'MEMBER_COMMAND_UNSUPPORTED')
+    }
 
+    // Own the accepted instruction before async lookup or a contended mailbox
+    // write. The durable inbox owns it after this operation has settled.
+    this.pendingMemberMessages += 1
+    powerActivityClock.changed()
+    try {
+      await this.writeMemberMessage(teamName, agentId, text)
+    } finally {
+      this.pendingMemberMessages -= 1
+      powerActivityClock.changed()
+    }
+  }
+
+  private async writeMemberMessage(teamName: string, agentId: string, text: string): Promise<void> {
     const config = await this.loadTeamConfig(teamName)
     const recipientName = await this.resolveMemberName(
       config,
@@ -2985,6 +3011,25 @@ export class TeamService {
       : typeof message?.model === 'string'
         ? message.model
         : undefined
+    const hasToolResult =
+      entryType === 'tool_result' ||
+      (entryType === 'user' &&
+        Array.isArray(content) &&
+        content.some(
+          block =>
+            Boolean(
+              block &&
+              typeof block === 'object' &&
+              (block as { type?: unknown }).type === 'tool_result',
+            ),
+        ))
+    const durationMs =
+      hasToolResult &&
+      typeof entry.durationMs === 'number' &&
+      Number.isFinite(entry.durationMs) &&
+      entry.durationMs >= 0
+        ? entry.durationMs
+        : undefined
     const transcriptMessage: TranscriptMessage = {
       id: (entry.uuid as string) || crypto.randomUUID(),
       type: entryType as TranscriptMessage['type'],
@@ -2995,6 +3040,7 @@ export class TeamService {
         : {}),
       ...(model ? { model } : {}),
       ...(entry.toolUseResult !== undefined ? { toolUseResult: entry.toolUseResult } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
     }
     if (!ownerAgentId) return transcriptMessage
     return {

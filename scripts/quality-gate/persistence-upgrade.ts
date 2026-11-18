@@ -9,6 +9,24 @@ type Check = {
 const rootDir = process.cwd()
 const checks: Check[] = [
   {
+    title: 'WeChat delivery journal and media preference schema upgrades preserve old fixtures',
+    command: ['bun', 'test', './adapters/wechat/__tests__/delivery-store.test.ts', './adapters/wechat/__tests__/media-preferences.test.ts'],
+  },
+  {
+    title: 'Project auxiliary directories and legacy session snapshots',
+    command: ['bun', 'test', './src/server/services/sessionService.additionalDirectories.test.ts'],
+  },
+  {
+    title: 'Idle power preferences migrate disabled and preserve the last action record',
+    command: ['bun', 'run', 'test', '--', '--run', 'electron/services/idlePowerPersistence.test.ts'],
+    cwd: 'desktop',
+  },
+  {
+    title: 'Desktop native appearance caches preserve old fixtures and both ground preferences',
+    command: ['bun', 'run', 'test', '--', '--run', 'electron/services/nativeAppearance.test.ts'],
+    cwd: 'desktop',
+  },
+  {
     title: 'Session archive metadata migration and transcript-preserving restart recovery',
     command: ['bun', 'test', './src/server/__tests__/session-archive.test.ts', './src/utils/cleanup.sessionArchive.test.ts'],
   },
@@ -23,6 +41,11 @@ const checks: Check[] = [
   {
     title: 'Desktop WebSearch settings migrate old fixtures for the DeepSeek backend',
     command: ['bun', 'run', 'test', '--', '--run', 'src/stores/settingsStoreWebSearch.test.ts'],
+    cwd: 'desktop',
+  },
+  {
+    title: 'Desktop terminal font settings upgrade shell-only fixtures without rewriting user settings',
+    command: ['bun', 'run', 'test', '--', '--run', 'src/stores/settingsStore.test.ts', '-t', 'desktop terminal'],
     cwd: 'desktop',
   },
   {
@@ -43,6 +66,10 @@ const checks: Check[] = [
     command: ['bun', 'test', './src/utils/swarm/teamPlanStore.test.ts', './src/server/services/teamPlanService.test.ts'],
   },
   {
+    title: 'Agent Teams incarnation runtime gate migration, original backups and forward fields',
+    command: ['bun', 'test', './src/utils/swarm/teamRuntimeControlStore.test.ts'],
+  },
+  {
     title: 'Agent Teams legacy mailbox migration to unread inbox plus history',
     command: ['bun', 'test', './src/utils/teammateMailbox.test.ts', '--test-name-pattern', 'legacy inbox files'],
   },
@@ -53,6 +80,10 @@ const checks: Check[] = [
   {
     title: 'Agent Teams teammate resume from agent metadata written before the teammate fields',
     command: ['bun', 'test', './src/utils/swarm/inProcessRunner.resume.test.ts', '--test-name-pattern', 'metadata written before'],
+  },
+  {
+    title: 'SubAgent runs from agent metadata written before launch effort was recorded report no effort',
+    command: ['bun', 'test', './src/server/services/subagentRunService.test.ts', '--test-name-pattern', 'metadata written before effort was recorded'],
   },
   {
     title: 'Session collaboration state migration and recovery',
@@ -98,6 +129,17 @@ const checks: Check[] = [
       './src/server/__tests__/desktop-ui-preferences.test.ts',
       '--test-name-pattern',
       'normalizes old schema files',
+    ],
+  },
+  {
+    title: 'Voice input preferences saved before AI correction and the personal vocabulary file',
+    command: [
+      'bun',
+      'test',
+      './src/server/__tests__/desktop-ui-preferences.test.ts',
+      './src/server/services/voice/vocabulary/store.test.ts',
+      '--test-name-pattern',
+      'voiceInput|voice vocabulary file',
     ],
   },
   {

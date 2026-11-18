@@ -23,6 +23,7 @@ vi.mock('../api/sessions', () => ({
     rename: vi.fn(),
     setArchived: archiveMock,
     getSummary: summaryMock,
+    invalidateGitInfo: vi.fn(),
   },
 }))
 
@@ -149,6 +150,43 @@ describe('sessionStore', () => {
     expect(archiveMock).toHaveBeenLastCalledWith(item.id, false)
   })
 
+  it('archives a batch with one refresh, keeps refused sessions, and restores the batch together', async () => {
+    const first = makeSession('batch-first', '2026-10-03T00:00:00Z')
+    const busy = makeSession('batch-busy', '2026-10-02T00:00:00Z')
+    const last = makeSession('batch-last', '2026-10-01T00:00:00Z')
+    useSessionStore.setState({
+      sessions: [first, busy, last],
+      recentSessionIds: new Set([first.id, busy.id, last.id]),
+      selectedSessionIds: new Set([first.id, busy.id, last.id]),
+    })
+    archiveMock.mockImplementation(async (id: string, archived: boolean) => {
+      if (id === busy.id) throw new ApiError(409, { code: 'SESSION_ACTIVE', message: 'Session is active' })
+      return { success: true, archived }
+    })
+    listMock.mockResolvedValue({ sessions: [busy], total: 1 })
+
+    const archived = await useSessionStore.getState().setSessionsArchived([first.id, busy.id, last.id], true)
+
+    expect(archived.successes).toEqual([first.id, last.id])
+    expect(archived.failures).toEqual([{ id: busy.id, error: expect.objectContaining({ status: 409 }) }])
+    expect(archiveMock.mock.calls).toEqual([[first.id, true], [busy.id, true], [last.id, true]])
+    expect(listMock).toHaveBeenCalledTimes(1)
+    const afterArchive = useSessionStore.getState()
+    expect(afterArchive.sessions.find(s => s.id === busy.id)?.archived).not.toBe(true)
+    expect([...afterArchive.recentSessionIds]).toEqual([busy.id])
+    expect([...afterArchive.selectedSessionIds]).toEqual([busy.id])
+
+    listMock.mockClear()
+    summaryMock.mockImplementation(async (id: string) => ({ ...(id === first.id ? first : last), archived: true }))
+    listMock.mockResolvedValue({ sessions: [first, busy, last], total: 3 })
+    const restored = await useSessionStore.getState().setSessionsArchived(archived.successes, false)
+
+    expect(restored).toEqual({ successes: [first.id, last.id], failures: [] })
+    expect(listMock).toHaveBeenCalledTimes(1)
+    expect(useSessionStore.getState().sessions.filter(s => s.archived).map(s => s.id)).toEqual([])
+    expect(useSessionStore.getState().sessions.map(s => s.id)).toEqual(expect.arrayContaining([first.id, busy.id, last.id]))
+  })
+
   it('refreshes archive flags on cached historical tabs when another client archives or restores them', async () => {
     const item = makeSession('archive-other-client', '2020-01-01T00:00:00Z')
     useSessionStore.getState().openHistoricalSession(item)
@@ -273,6 +311,29 @@ describe('sessionStore', () => {
     await delay(0)
 
     expect(useSessionStore.getState().sessions[0]?.title).toBe('开始优化UI')
+  })
+
+  it.each(['off', 'building'] as const)('keeps an init directory through stale %s list refreshes until persistence catches up', async indexMode => {
+    const row = makeSession(`workspace-refresh-${indexMode}`, '2026-11-11T00:00:00Z')
+    const other = makeSession('workspace-other', '2026-11-11T00:00:00Z')
+    useSessionStore.setState({ sessions: [row, other] })
+    const pending = createDeferred<{ sessions: typeof row[]; total: number }>()
+    listMock.mockReturnValueOnce(pending.promise)
+    const refresh = useSessionStore.getState().fetchSessions()
+    const workDir = '/workspace/project/.claude/worktrees/entered'
+    useSessionStore.getState().updateSessionWorkDir(row.id, workDir)
+    const stale = { sessions: [row, other], total: 2, index: makeIndexStatus(indexMode) }
+    pending.resolve(stale)
+    await refresh
+    expect(useSessionStore.getState().sessions.find(item => item.id === row.id)?.workDir).toBe(workDir)
+    expect(useSessionStore.getState().sessions.find(item => item.id === other.id)?.workDir).toBe(other.workDir)
+    listMock.mockResolvedValueOnce(stale)
+    await useSessionStore.getState().fetchSessions()
+    expect(useSessionStore.getState().sessions.find(item => item.id === row.id)?.workDir).toBe(workDir)
+    listMock.mockResolvedValueOnce({ sessions: [{ ...row, workDir }, other], total: 2 })
+    await useSessionStore.getState().fetchSessions()
+    useSessionStore.getState().updateSessionWorkDir(row.id, row.workDir)
+    expect(useSessionStore.getState().sessions.find(item => item.id === row.id)?.workDir).toBe(row.workDir)
   })
 
   it('applies a collaboration title that arrives before the indexed session row', async () => {

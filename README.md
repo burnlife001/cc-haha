@@ -19,7 +19,7 @@
 
 </div>
 
-cc-haha 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索、分支 / Worktree 启动、Diff 审阅、内置浏览器预览、图形化权限审批、模型自选（Claude / ChatGPT / Grok / 预设 / 本地端点）、图片生成、MCP 与 SubAgent 可视化管理、Agent Teams 协作工作台、动态 Workflow 编排、模型请求追踪、Computer Use、技能市场、多主题、桌面宠物、手机 App 与 H5 远程访问、IM 接入和定时任务，集中在一个 macOS / Windows / Linux APP 里。**在 macOS 上，Computer Use 能操作其他应用，同时不占用你的真实鼠标和键盘。** 配套的 Android / iPhone App 扫码连上电脑，离开工位也能审批、派任务。
+cc-haha 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索、分支 / Worktree 启动、Diff 审阅、内置浏览器预览、图形化权限审批、模型自选（Claude / ChatGPT / Grok / 预设 / 本地端点）、图片生成、MCP 与 SubAgent 可视化管理、Agent Teams 协作工作台、动态 Workflow 编排、模型请求追踪、Computer Use、技能市场、多主题、桌面宠物、手机 App 与 H5 远程访问、IM 接入和定时任务，集中在一个 macOS / Windows / Linux APP 里。**Computer Use 在 macOS 上使用原有原生引擎，在 Windows / Linux 上复用 agent-desktop；支持的后台语义操作不移动真实鼠标，物理输入仍会占用前台。** 配套的 Android / iPhone App 扫码连上电脑，离开工位也能审批、派任务。
 
 <p align="center"><b>白金赞助商 · Modelflare</b></p>
 
@@ -36,7 +36,7 @@ cc-haha 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索�
 <p><sub><b>特惠活动：</b>单笔充值 US$20 即可解锁 0.015 倍价格倍率的 GPT 特惠分组，单笔充值 US$50 即可解锁 0.03 倍价格倍率的 Claude 特惠分组。通过 <a href="https://modelflare.dev/sign-up?utm_source=github&amp;utm_campaign=cchaha">专属链接注册</a>即可参与。</sub></p>
 
 <p align="center">
-  <a href="#功能预览">功能预览</a> · <a href="#安装">安装</a> · <a href="#桌面端亮点">桌面端亮点</a> · <a href="#更多文档">更多文档</a> · <a href="#赞助与合作">赞助与合作</a> · <a href="#用户交流群">用户交流群</a>
+  <a href="#功能预览">功能预览</a> · <a href="#安装">安装</a> · <a href="#桌面端亮点">桌面端亮点</a> · <a href="#更多文档">更多文档</a> · <a href="#赞助与合作">赞助与合作</a>
 </p>
 
 ---
@@ -60,8 +60,8 @@ cc-haha 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索�
       <br><sub><a href="docs/internals/agent.md">Agent Teams</a></sub>
     </td>
     <td width="33%" align="center" valign="top">
-      <img src="docs/images/readme/computer-use-zh.webp" width="100%" alt="Computer Use：Agent 用独立的虚拟光标操作其他应用，你的鼠标和键盘照常使用">
-      <br><sub><a href="docs/desktop/computer-use.md">Computer Use</a></sub>
+      <img src="docs/images/readme/computer-use-zh.webp" width="100%" alt="Computer Use macOS 示例：Agent 用虚拟光标操作其他应用，真实鼠标仍可使用">
+      <br><sub><a href="docs/desktop/computer-use.md">Computer Use（macOS 示例）</a></sub>
     </td>
   </tr>
   <tr>
@@ -116,6 +116,26 @@ cc-haha 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索�
     </tr>
     <tr>
       <td align="center" valign="middle">
+        <a href="https://www.kk-vibe.top/r/j8d6we">
+          <img src="docs/images/sponsors/kkvibe-logo.png" width="180" alt="kk-vibe">
+        </a>
+      </td>
+      <td valign="middle">
+        感谢 <a href="https://www.kk-vibe.top/r/j8d6we">kk-vibe</a> 对本项目的赞助！kk-vibe 覆盖 GPT、Claude、Gemini、DeepSeek 等主流模型，24 小时「鹈鹕骑车」实测，渠道状态随时可查。内置无限画布，支持 GPT、Nano Banana 生图，兼顾编程开发与视觉创作。模型表现看得见 · 无限画布自由创作。
+      </td>
+    </tr>
+    <tr>
+      <td align="center" valign="middle">
+        <a href="https://www.dynadot.com/zh/market?utm_source=github&amp;utm_medium=display&amp;utm_campaign=dm&amp;drefid=5638">
+          <img src="docs/images/sponsors/dynadot-logo.png" width="180" alt="Dynadot">
+        </a>
+      </td>
+      <td valign="middle">
+        Dynadot 是 ICANN 认证域名注册商，域名保有量全球前五，首屈一指的国际域名交易平台，提供优质的以域名为中心的域名注册，域名交易，域名管理，以及企业邮箱及建站服务。为所有用户提供多种域名优惠，并支持免费提交域名抢注需求。访问集合多种类，低佣金，可分期且无保留价格的 <a href="https://www.dynadot.com/zh/market?utm_source=github&amp;utm_medium=display&amp;utm_campaign=dm&amp;drefid=5638">Dynadot 域名市场</a>，找到与您最匹配的心仪域名。
+      </td>
+    </tr>
+    <tr>
+      <td align="center" valign="middle">
         <a href="https://www.zuiquanapi.com/"><b>最全 API<br>中转站导航</b></a>
       </td>
       <td valign="middle">
@@ -137,16 +157,6 @@ cc-haha 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索�
 4. 手机端（可选）：Android 在 Releases 下载 `cc-haha-mobile-*.apk` 安装；iPhone 先装 TestFlight，再打开[公开链接](https://testflight.apple.com/join/Nd49JrWZ)加入测试。手机 App 需要桌面端 v0.7.6 或更新版本。在桌面端「手机连接」里扫码配对，同一 Wi-Fi 直连，外出用 Cloudflare 连接，详见 [手机 App 与远程连接](docs/desktop/remote.md)。
 
 发布可信度与隐私：[Code signing policy](docs/start/code-signing.md) · [隐私与联网说明](docs/start/privacy.md)
-
----
-
-## 用户交流群
-
-使用过程中有问题、想反馈 Bug，或者想看看别人怎么用，欢迎扫码加入 cc-haha 企业微信用户群。也可以直接来 [Issues](https://github.com/NanmiCoder/cc-haha/issues) 提问。企业定制 / 私有化部署 / Agent 定制需求，请联系作者 [NanmiCoder](https://github.com/NanmiCoder)。
-
-<p align="center">
-  <img src="docs/images/community/wechat-group-qr.png" width="300" alt="cc-haha 企业微信用户群二维码">
-</p>
 
 ---
 
@@ -193,7 +203,7 @@ cc-haha 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索�
 - **Agent Teams 协作工作台**：桌面端可视化多 Agent 协作团队——成员、任务、通信流和依赖泳道一目了然。
 - **动态 Workflow 编排**：模型当场编写并运行编排脚本，并发或流水线调度多个子代理，支持阶段视图、中断与断点续跑。
 - **模型请求追踪**：本地记录每轮模型请求的状态与耗时，可搜索筛选，快速定位卡死或失败调用。
-- **Computer Use**：让 Agent 在授权后截图、点击、输入并控制桌面应用；macOS 原生运行时不占用你的真实鼠标和键盘。
+- **Computer Use**：macOS / Windows / Linux 原生桌面控制，无需 Python；一次确认授权所有受支持应用。Windows / Linux 复用 agent-desktop，优先后台语义操作；需要物理输入时仍受系统与前台限制。
 - **桌面宠物**：搭搭、弧弧、补补、回回随任务状态换动作，也能自己做一只（默认关闭）。
 - **手机 App 与 H5**：Android / iPhone App 扫码连上电脑，在手机上审批工具调用、回答提问、派新任务、查看改动、随时停止；也可以直接用手机浏览器接入。任务始终在电脑上跑，手机锁屏切后台都不打断。
 - **IM 接入**：通过 Telegram / 飞书 / 微信 / 钉钉 / WhatsApp / 企业微信 / QQ / Slack 远程对话、切换项目和审批权限。
@@ -234,6 +244,7 @@ cc-haha 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索�
 
 - [React](https://github.com/facebook/react)：前端工程与组件化 UI 生态。
 - [Electron](https://github.com/electron/electron)：跨端桌面应用能力与工程实践。
+- [agent-desktop](https://github.com/vercel-labs/agent-desktop)（Vercel Labs）：Windows / Linux Computer Use 参考并直接复用其原生实现。固定版本 **1.0.2**，commit [`9eb9b296192fcb70bda25e918cd6dd66abfa3d0d`](https://github.com/vercel-labs/agent-desktop/tree/9eb9b296192fcb70bda25e918cd6dd66abfa3d0d)；保留 [Apache-2.0 许可](native/agent-desktop/LICENSE)、[来源与文件摘要](native/agent-desktop/UPSTREAM.json)及[本地改动说明](native/agent-desktop/PATCHES.md)。
 - [cc-switch](https://github.com/farion1231/cc-switch)：模型供应商配置能力参考。
 - [LINUX DO](https://linux.do/)：新的理想型开发者社区。
 - [AtomGit](https://atomgit.com/NanmiCoder/cc-haha)：为本项目提供国内代码托管。
@@ -253,3 +264,5 @@ cc-haha 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索�
 ## 许可说明
 
 当前采用 [cc-haha Community Source License 1.0](LICENSE)。允许个人非商业使用及企业内部自用；接单、对外商业盈利、收费修改或二次开发、商业分发及付费服务须事先取得书面商业授权；二次分发须显著保留来源署名。历史 MIT 授权与第三方许可继续有效。详见[许可说明](LICENSING.md)。当前许可属于源码可用许可，不是 OSI 认可的开源许可证。
+
+复用的 agent-desktop 原有代码继续适用 Apache-2.0，其原授权不受本项目 Community Source License 的额外限制；第三方依赖保留各自许可，见[第三方许可](THIRD_PARTY_LICENSES.md)。

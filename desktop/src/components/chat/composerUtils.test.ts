@@ -9,6 +9,7 @@ import {
   getSlashCommandNameConflict,
   groupSlashCommands,
   insertSlashTrigger,
+  isTeamMemberSlashCommand,
   mergeSlashCommands,
   replaceSlashCommand,
   resolveSlashUiAction,
@@ -117,6 +118,38 @@ describe('composerUtils', () => {
         },
       ]),
     )
+  })
+
+  it('guards non-string runtime argumentHint and description values in merge and filter', () => {
+    const merged = mergeSlashCommands([
+      {
+        name: 'plugin:port',
+        description: 123 as unknown as string,
+        argumentHint: 8080 as unknown as string,
+        kind: 'command',
+      },
+    ], [])
+
+    expect(merged).toEqual([
+      {
+        name: 'plugin:port',
+        description: '',
+        kind: 'command',
+      },
+    ])
+    expect(
+      filterSlashCommands(
+        [
+          {
+            name: 'plugin:port',
+            description: 123 as unknown as string,
+            argumentHint: 8080 as unknown as string,
+            kind: 'command',
+          },
+        ],
+        'port',
+      ),
+    ).toHaveLength(1)
   })
 
   it('keeps /goal as a single command with argument hints instead of pseudo subcommands', () => {
@@ -360,4 +393,16 @@ it('orders plugin mentions between commands and skills without changing their ca
   ])
   expect(groups.plugins?.map(item => item.name)).toEqual(['plugin:hyperframes'])
   expect(groups.ordered.map(item => item.name)).toEqual(['help', 'skill:video', 'plugin:hyperframes'])
+})
+
+it('keeps a team member menu to commands its own CLI runs', () => {
+  // The server refuses these for a member; the model picker is the way to swap models.
+  for (const name of ['clear', 'reset', 'new', 'model', 'Model']) expect(isTeamMemberSlashCommand(name)).toBe(false)
+  // Handled by this desktop against the chat on screen, so a member never sees them.
+  for (const name of ['btw', 'goal', 'context', 'status', 'cost', 'help', 'mcp', 'skills', 'save-workflow', 'config', 'settings', 'plugin', 'plugins', 'memory', 'doctor']) {
+    expect(isTeamMemberSlashCommand(name)).toBe(false)
+  }
+  for (const name of ['compact', 'review', 'init', 'agent', 'agent explorer', 'frontend-design', 'plugin:hyperframes']) {
+    expect(isTeamMemberSlashCommand(name)).toBe(true)
+  }
 })

@@ -102,6 +102,7 @@ import { quote } from './bash/shellQuote.js'
 import { formatNumber, formatTokens } from './format.js'
 import { getPewterLedgerVariant } from './planModeV2.js'
 import { jsonStringify } from './slowOperations.js'
+import { addTaskNotificationModelGuidance } from './taskNotificationPolicy.js'
 
 // Hook attachments that have a hookName field (excludes HookPermissionDecisionAttachment)
 type HookAttachmentWithName = Exclude<
@@ -497,6 +498,7 @@ export function createUserMessage({
   isCompactSummary,
   summarizeMetadata,
   toolUseResult,
+  durationMs,
   mcpMeta,
   uuid,
   timestamp,
@@ -511,6 +513,8 @@ export function createUserMessage({
   isVirtual?: true
   isCompactSummary?: true
   toolUseResult?: unknown // Matches tool's `Output` type
+  /** Actual tool execution duration in ms (excludes streaming buffer, queue wait, and permission dialog wait). */
+  durationMs?: number
   /** MCP protocol metadata to pass through to SDK consumers (never sent to model) */
   mcpMeta?: {
     _meta?: Record<string, unknown>
@@ -545,6 +549,7 @@ export function createUserMessage({
     uuid: (uuid as UUID | undefined) || randomUUID(),
     timestamp: timestamp ?? new Date().toISOString(),
     toolUseResult,
+    ...(durationMs !== undefined ? { durationMs } : {}),
     mcpMeta,
     imagePasteIds,
     sourceToolAssistantUUID,
@@ -829,6 +834,10 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
         }
         isNewChain = isNewChain || message.message.content.length > 1
         let imageIndex = 0
+        const singleToolResultDurationMs =
+          message.message.content.filter(block => block.type === 'tool_result').length === 1
+            ? message.durationMs
+            : undefined
         return message.message.content.map((_, index) => {
           const isImage = _.type === 'image'
           // For image content blocks, extract just the ID for this image
@@ -841,6 +850,7 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
             ...createUserMessage({
               content: [_],
               toolUseResult: message.toolUseResult,
+              durationMs: _.type === 'tool_result' ? singleToolResultDurationMs : undefined,
               mcpMeta: message.mcpMeta,
               isMeta: message.isMeta,
               isVisibleInTranscriptOnly: message.isVisibleInTranscriptOnly,
@@ -2028,35 +2038,39 @@ function relocateToolReferenceSiblings(
  * media was there. Returns the same object when there is nothing to replace.
  *
  * Only user messages carry media; assistant messages hold text, tool_use and
- * thinking blocks.
+ * thinking blocks. `markers` picks the block types to replace and their text;
+ * by default both images and documents are replaced.
  */
-export function replaceMediaWithPlaceholders(message: UserMessage): UserMessage {
+export function replaceMediaWithPlaceholders(
+  message: UserMessage,
+  markers: { image?: string; document?: string } = {
+    image: '[image]',
+    document: '[document]',
+  },
+): UserMessage {
   const content = message.message.content
   if (!Array.isArray(content)) {
     return message
   }
 
+  const markerFor = (type: string) =>
+    type === 'image' || type === 'document' ? markers[type] : undefined
+
   let hasMediaBlock = false
   const newContent = content.flatMap(block => {
-    if (block.type === 'image') {
+    const marker = markerFor(block.type)
+    if (marker !== undefined) {
       hasMediaBlock = true
-      return [{ type: 'text' as const, text: '[image]' }]
-    }
-    if (block.type === 'document') {
-      hasMediaBlock = true
-      return [{ type: 'text' as const, text: '[document]' }]
+      return [{ type: 'text' as const, text: marker }]
     }
     // Also replace media nested inside tool_result content arrays
     if (block.type === 'tool_result' && Array.isArray(block.content)) {
       let toolHasMedia = false
       const newToolContent = block.content.map(item => {
-        if (item.type === 'image') {
+        const itemMarker = markerFor(item.type)
+        if (itemMarker !== undefined) {
           toolHasMedia = true
-          return { type: 'text' as const, text: '[image]' }
-        }
-        if (item.type === 'document') {
-          toolHasMedia = true
-          return { type: 'text' as const, text: '[document]' }
+          return { type: 'text' as const, text: itemMarker }
         }
         return item
       })
@@ -2095,10 +2109,41 @@ function isRequestTooLargeAnchor(
   )
 }
 
+function prepareTaskNotificationForAPI(message: UserMessage): UserMessage {
+  if (message.origin?.kind !== 'task-notification') return message
+  const content = addTaskNotificationModelGuidance(message.message.content)
+  return content === message.message.content
+    ? message
+    : { ...message, message: { ...message.message, content } }
+}
+
+function isBackgroundTaskNotification(message: Message): boolean {
+  let content: unknown
+  if (message.type === 'user' && message.origin?.kind === 'task-notification') {
+    content = message.message.content
+  } else if (
+    message.type === 'attachment' && message.attachment?.type === 'queued_command' &&
+    (message.attachment.origin?.kind === 'task-notification' ||
+      (!message.attachment.origin && message.attachment.commandMode === 'task-notification'))
+  ) {
+    content = message.attachment.prompt
+  } else {
+    return false
+  }
+  // The queue mode is also used for hook and cancellation instructions.
+  // Only lifecycle XML should receive the background-result guidance.
+  return typeof content === 'string'
+    ? content.includes('<task-notification>')
+    : Array.isArray(content) && content.some(block =>
+      block !== null && typeof block === 'object' && block.type === 'text' &&
+      typeof block.text === 'string' && block.text.includes('<task-notification>'))
+}
+
 export function normalizeMessagesForAPI(
   messages: Message[],
   tools: Tools = [],
   currentModel?: string,
+  mapImageInput?: (source: Message, message: UserMessage) => UserMessage,
 ): (UserMessage | AssistantMessage)[] {
   // Build set of available tool names for filtering unavailable tool references
   const availableToolNames = new Set(tools.map(t => t.name))
@@ -2109,6 +2154,9 @@ export function normalizeMessagesForAPI(
   const reorderedMessages = reorderAttachmentsForAPI(messages).filter(
     m => !((m.type === 'user' || m.type === 'assistant') && m.isVirtual),
   )
+  // One instruction covers all results in this request. Keep it next to the
+  // newest internal update rather than adding another copy for every old task.
+  const latestTaskNotification = reorderedMessages.findLast(isBackgroundTaskNotification)
 
   // Build a fallback map from legacy error text → which block types to strip
   // from the preceding user message. New synthetic errors use stable
@@ -2351,6 +2399,11 @@ export function normalizeMessagesForAPI(
             }
           }
 
+          if (message === latestTaskNotification) {
+            normalizedMessage = prepareTaskNotificationForAPI(normalizedMessage)
+          }
+          normalizedMessage = mapImageInput?.(message, normalizedMessage) ?? normalizedMessage
+
           // If the last message is also a user message, merge them
           const lastMessage = last(result)
           if (lastMessage?.type === 'user') {
@@ -2461,14 +2514,18 @@ export function normalizeMessagesForAPI(
             )
             return
           }
+          if (message === latestTaskNotification) {
+            rawAttachmentMessage = rawAttachmentMessage.map(prepareTaskNotificationForAPI)
+          }
           const keptAttachmentMessage = mediaStripped.has(message)
             ? rawAttachmentMessage.map(m => replaceMediaWithPlaceholders(m))
             : rawAttachmentMessage
-          const attachmentMessage = checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
+          let attachmentMessage = checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
             'tengu_chair_sermon',
           )
             ? keptAttachmentMessage.map(ensureSystemReminderWrap)
             : keptAttachmentMessage
+          if (mapImageInput) attachmentMessage = attachmentMessage.map(m => mapImageInput(message, m))
 
           // If the last message is also a user message, merge them
           const lastMessage = last(result)
@@ -5417,9 +5474,13 @@ export function filterOrphanedThinkingOnlyMessages(
  * Strip signature-bearing blocks (thinking, redacted_thinking, connector_text)
  * from all assistant messages. Their signatures are bound to the API key that
  * generated them; after a credential change (e.g. /login) they're invalid and
- * the API rejects them with a 400.
+ * the API rejects them with a 400. `shouldStrip` limits the strip to some
+ * assistant messages; by default every one is stripped.
  */
-export function stripSignatureBlocks(messages: Message[]): Message[] {
+export function stripSignatureBlocks(
+  messages: Message[],
+  shouldStrip: (msg: AssistantMessage) => boolean = () => true,
+): Message[] {
   let changed = false
   const result = messages.map(msg => {
     if (msg.type !== 'assistant') return msg
@@ -5434,7 +5495,7 @@ export function stripSignatureBlocks(messages: Message[]): Message[] {
       }
       return true
     })
-    if (filtered.length === content.length) return msg
+    if (filtered.length === content.length || !shouldStrip(msg)) return msg
 
     // Strip to [] even for thinking-only messages. Streaming yields each
     // content block as a separate same-id AssistantMessage (claude.ts:2150),
@@ -5457,30 +5518,32 @@ export function stripSignatureBlocks(messages: Message[]): Message[] {
 /**
  * Protected thinking signatures are model-bound. When a resumed session moves
  * to another model, replaying those blocks can either fail signature validation
- * or send a block type the new provider does not implement. Keep the transcript
- * intact and clean only the in-memory request history.
+ * or send a block type the new provider does not implement. Decide per message:
+ * once the new model has produced thinking of its own, the older model's blocks
+ * are still in history and must keep being removed. Keep the transcript intact
+ * and clean only the in-memory request history.
  */
 export function stripSignatureBlocksAfterModelChange(
   messages: Message[],
   currentModel: string,
 ): Message[] {
-  const signatureSource = messages.findLast(msg => (
-    msg.type === 'assistant' &&
-    msg.message.model !== SYNTHETIC_MODEL &&
-    msg.message.content.some(isThinkingBlock)
-  ))
-  if (signatureSource?.type !== 'assistant' || !signatureSource.message.model) {
-    return messages
+  const normalized = new Map<string, string>()
+  const normalize = (model: string) => {
+    let value = normalized.get(model)
+    if (value === undefined) {
+      value = normalizeModelStringForAPI(parseUserSpecifiedModel(model))
+        .trim()
+        .toLowerCase()
+      normalized.set(model, value)
+    }
+    return value
   }
+  const target = normalize(currentModel)
 
-  const normalize = (model: string) => normalizeModelStringForAPI(
-    parseUserSpecifiedModel(model),
-  ).trim().toLowerCase()
-
-  if (normalize(signatureSource.message.model) === normalize(currentModel)) {
-    return messages
-  }
-  return stripSignatureBlocks(messages)
+  return stripSignatureBlocks(messages, msg => {
+    const model = msg.message.model
+    return !!model && model !== SYNTHETIC_MODEL && normalize(model) !== target
+  })
 }
 
 /**

@@ -106,7 +106,7 @@ export type ServerMessage =
   | { type: 'content_start'; blockType: 'text' | 'tool_use'; toolName?: string; toolUseId?: string; originalToolUseId?: string; parentToolUseId?: string }
   | { type: 'content_delta'; text?: string; toolInput?: string }
   | { type: 'tool_use_complete'; toolName: string; toolUseId: string; originalToolUseId?: string; input: unknown; parentToolUseId?: string }
-  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string }
+  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string; durationMs?: number }
   | {
       type: 'permission_request'
       requestId: string
@@ -168,7 +168,7 @@ export type ServerMessage =
     }
   // 流式请求失败后的恢复状态：可能安全重试流，也可能降级为非流式请求。
   | { type: 'streaming_fallback'; cause: StreamingFallbackCause }
-  | { type: 'error'; message: string; code: string; retryable?: boolean; businessErrorCode?: string }
+  | { type: 'error'; message: string; code: string; retryable?: boolean; businessErrorCode?: string; transcriptMessageId?: string }
   | { type: 'background_task_stop_failed'; taskId: string; message: string }
   | { type: 'system_notification'; subtype: string; message?: string; data?: unknown }
   | { type: 'pong' }
@@ -179,6 +179,8 @@ export type ServerMessage =
   | { type: 'team_deleted'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'task_update'; taskId: string; status: string; progress?: string }
   | { type: 'session_title_updated'; sessionId: string; title: string }
+  /** Predicted next user prompt for the composer; sent after a turn ends. */
+  | { type: 'prompt_suggestion'; suggestion: string }
 
 export type CompactProgress = {
   /** Cumulative summary characters for the current compaction attempt; restarts from 0 on a CLI retry. */
@@ -189,7 +191,7 @@ export type AgentRunStreamMessage =
   | { type: 'content_start'; blockType: 'text' | 'tool_use'; toolName?: string; toolUseId?: string; originalToolUseId?: string; parentToolUseId?: string }
   | { type: 'content_delta'; text?: string; toolInput?: string }
   | { type: 'tool_use_complete'; toolName: string; toolUseId: string; originalToolUseId?: string; input: unknown; parentToolUseId?: string }
-  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string }
+  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string; durationMs?: number }
   | { type: 'thinking'; text: string; complete?: boolean }
   | { type: 'status'; state: ChatState; verb?: string; attemptStart?: boolean }
   | { type: 'api_retry'; attempt: number; maxRetries: number; retryDelayMs: number; errorStatus: number | null; errorType?: string; errorMessage?: string; requestId?: string }
@@ -387,9 +389,18 @@ export type UIMessage =
       status?: 'stopped'
       partialInput?: string
     }
-  | { id: string; type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; timestamp: number; parentToolUseId?: string }
+  | { id: string; type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; timestamp: number; parentToolUseId?: string; durationMs?: number }
   | { id: string; type: 'background_task'; task: BackgroundAgentTask; timestamp: number }
-  | { id: string; type: 'system'; content: string; generationStopped?: boolean; transcriptMessageId?: string; timestamp: number }
+  | {
+      id: string
+      type: 'system'
+      content: string
+      generationStopped?: boolean
+      /** Background tasks whose results started this turn without a user send. */
+      backgroundContinueTaskIds?: string[]
+      transcriptMessageId?: string
+      timestamp: number
+    }
   | {
       id: string
       type: 'compact_summary'
@@ -435,5 +446,5 @@ export type UIMessage =
       displayName?: string
       timestamp: number
     }
-  | { id: string; type: 'error'; message: string; code: string; businessErrorCode?: string; timestamp: number }
+  | { id: string; type: 'error'; message: string; code: string; businessErrorCode?: string; transcriptMessageId?: string; timestamp: number }
   | { id: string; type: 'task_summary'; tasks: TaskSummaryItem[]; timestamp: number }

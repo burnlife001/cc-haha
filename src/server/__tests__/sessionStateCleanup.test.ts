@@ -44,6 +44,7 @@ const CONTAINERS: Record<string, Classification> = {
   activeBackgroundTaskIds: { kind: 'cleared' },
   activeCliRuns: { kind: 'cleared' },
   cliRunsAwaitingBackgroundTasks: { kind: 'cleared' },
+  cliRunForegroundEpochs: { kind: 'cleared' },
   activeNonAgentTasks: { kind: 'cleared' },
   activeUserTurns: { kind: 'cleared' },
   agentStopRequestedSessions: { kind: 'cleared' },
@@ -76,6 +77,7 @@ const CONTAINERS: Record<string, Classification> = {
   sessionTurnObservers: { kind: 'cleared' },
   taskNotificationPersistence: { kind: 'cleared' },
   terminalSessionChatStates: { kind: 'cleared' },
+  userAdmissionQueues: { kind: 'cleared' },
 
   activeSessions: {
     kind: 'not-session-state',
