@@ -584,7 +584,159 @@ describe('SystemProxyBridge', () => {
       new Promise<string>(resolve => setTimeout(() => resolve('timed out'), 500)),
     ])).resolves.toBe('closed')
   })
+
+  it('tunnels absolute-URI HTTPS through an HTTP proxy with CONNECT instead of forwarding it in the clear', async () => {
+    const { port: targetPort, record } = await createHttpsEchoServer()
+    const proxy = await createConnectProxy(targetPort)
+    const bridge = await startBridge(async () => `PROXY 127.0.0.1:${proxy.port}`)
+
+    const response = await requestAbsoluteHttpsThroughBridge(
+      bridge,
+      `https://origin.example.test:${targetPort}/api/v1/auth?lang=en`,
+      'POST',
+      JSON.stringify({ app_id: 'cli_test' }),
+      { 'content-type': 'application/json', authorization: 'Bearer secret' },
+    )
+
+    expect(response.status).toBe(200)
+    const payload = JSON.parse(response.body)
+    expect(payload.url).toBe('/api/v1/auth?lang=en')
+    expect(payload.method).toBe('POST')
+    expect(payload.body).toBe(JSON.stringify({ app_id: 'cli_test' }))
+    // The proxy only ever learns the tunnel target; the request itself stays
+    // encrypted end to end.
+    expect(proxy.requests).toEqual([`CONNECT origin.example.test:${targetPort} HTTP/1.1`])
+    const captured = record()
+    expect(captured.url).toBe('/api/v1/auth?lang=en')
+    expect(captured.body).toBe(JSON.stringify({ app_id: 'cli_test' }))
+  })
+
+  it('runs TLS over the SOCKS5 socket for absolute-URI HTTPS requests', async () => {
+    const { port: targetPort, record } = await createHttpsEchoServer()
+    const proxy = await createSocks5Proxy(targetPort)
+    const bridge = await startBridge(async () => `SOCKS5 127.0.0.1:${proxy.port}`)
+
+    const response = await requestAbsoluteHttpsThroughBridge(
+      bridge,
+      `https://origin.example.test:${targetPort}/open-apis/im/v1/messages?count=2`,
+      'GET',
+    )
+
+    expect(response.status, response.body).toBe(200)
+    const payload = JSON.parse(response.body)
+    expect(payload.url).toBe('/open-apis/im/v1/messages?count=2')
+    expect(payload.method).toBe('GET')
+    // The reachability probe and the forwarded request both open a SOCKS
+    // connection to the same origin.
+    expect(proxy.requests).toEqual(['origin.example.test', 'origin.example.test'])
+    const captured = record()
+    expect(captured.url).toBe('/open-apis/im/v1/messages?count=2')
+  })
 })
+
+// A CONNECT proxy that tunnels every request to the local origin server and
+// records the request line it received.
+async function createConnectProxy(targetPort: number): Promise<{ port: number, requests: string[] }> {
+  const requests: string[] = []
+  const server = net.createServer(socket => {
+    sockets.add(socket)
+    socket.once('close', () => sockets.delete(socket))
+    let buffered = ''
+    const onData = (chunk: Buffer) => {
+      buffered += chunk.toString('latin1')
+      const separator = buffered.indexOf('\r\n\r\n')
+      if (separator < 0) return
+      const requestLine = buffered.slice(0, buffered.indexOf('\r\n'))
+      requests.push(requestLine)
+      socket.off('data', onData)
+      if (!/^CONNECT /i.test(requestLine)) {
+        socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
+        return
+      }
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      const upstream = net.connect(targetPort, '127.0.0.1', () => {
+        upstream.write(buffered.slice(separator + 4))
+        socket.pipe(upstream)
+        upstream.pipe(socket)
+      })
+      sockets.add(upstream)
+      upstream.once('close', () => sockets.delete(upstream))
+      upstream.on('error', () => socket.destroy())
+      socket.on('error', () => upstream.destroy())
+    }
+    socket.on('data', onData)
+  })
+  servers.push(server)
+  const port = await listen(server)
+  return { port, requests }
+}
+
+// A minimal SOCKS5 proxy that answers the greeting and the connect request,
+// then pipes the connection to the local origin server.
+async function createSocks5Proxy(targetPort: number): Promise<{ port: number, requests: string[] }> {
+  const requests: string[] = []
+  const server = net.createServer(socket => {
+    sockets.add(socket)
+    socket.once('close', () => sockets.delete(socket))
+    let stage: 'greeting' | 'request' | 'proxying' = 'greeting'
+    let buffered = Buffer.alloc(0)
+    const onData = (chunk: Buffer) => {
+      buffered = Buffer.concat([buffered, chunk])
+      if (stage === 'greeting') {
+        if (buffered.length < 2) return
+        const methodCount = buffered[1]!
+        if (buffered.length < 2 + methodCount) return
+        socket.write(Buffer.from([0x05, 0x00]))
+        buffered = buffered.slice(2 + methodCount)
+        stage = 'request'
+      }
+      if (stage === 'request') {
+        if (buffered.length < 5) return
+        const addressType = buffered[3]!
+        let host = ''
+        let offset = 4
+        if (addressType === 0x01) {
+          if (buffered.length < 10) return
+          host = Array.from(buffered.slice(4, 8)).join('.')
+          offset = 8
+        } else if (addressType === 0x03) {
+          const length = buffered[4]!
+          if (buffered.length < 5 + length + 2) return
+          host = buffered.slice(5, 5 + length).toString('latin1')
+          offset = 5 + length
+        } else {
+          socket.destroy()
+          return
+        }
+        requests.push(host)
+        const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1])
+        const portBytes = Buffer.allocUnsafe(2)
+        portBytes.writeUInt16BE(targetPort)
+        socket.write(Buffer.concat([reply, portBytes]))
+        buffered = buffered.slice(offset + 2)
+        stage = 'proxying'
+        // Hand the rest of the stream to the pipe; a 'data' listener would
+        // swallow the bytes that arrive before the upstream connection is up.
+        socket.off('data', onData)
+        const upstream = net.connect(targetPort, '127.0.0.1', () => {
+          upstream.write(buffered)
+          socket.pipe(upstream)
+          upstream.pipe(socket)
+        })
+        sockets.add(upstream)
+        upstream.once('close', () => sockets.delete(upstream))
+        upstream.on('error', () => socket.destroy())
+        socket.on('error', () => upstream.destroy())
+        return
+      }
+      stage = 'proxying'
+    }
+    socket.on('data', onData)
+  })
+  servers.push(server)
+  const port = await listen(server)
+  return { port, requests }
+}
 
 function createPendingProxyServer(port: number) {
   const server = new EventEmitter() as http.Server

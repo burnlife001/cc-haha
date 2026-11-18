@@ -789,3 +789,24 @@ it('keeps the tunnel working when the H5 origin sync fails', async () => {
   await screen.findByRole('button', { name: /^(?:Copy address|Copy pairing link)$/ })
   expect(updateH5AccessSettings).not.toHaveBeenCalled()
 })
+
+it('retries the H5 origin sync after a failed attempt', async () => {
+  mockOnline()
+  useSettingsStore.setState({
+    h5AccessError: null,
+    h5Access: { ...useSettingsStore.getState().h5Access, allowedOrigins: [] },
+  })
+  let calls = 0
+  const fetchH5Access = vi.spyOn(useSettingsStore.getState(), 'fetchH5Access').mockImplementation(async () => {
+    calls += 1
+    if (calls === 1) throw new Error('settings offline')
+  })
+  const updateH5AccessSettings = vi.spyOn(useSettingsStore.getState(), 'updateH5AccessSettings').mockResolvedValue(undefined)
+  render(<PublicAccessSettings />)
+  await waitFor(() => expect(calls).toBe(1), { timeout: 4000 })
+  await waitFor(
+    () => expect(updateH5AccessSettings).toHaveBeenCalledWith({ allowedOrigins: ['https://computer-fixture.trycloudflare.com'] }),
+    { timeout: 4000 },
+  )
+  expect(fetchH5Access).toHaveBeenCalledTimes(2)
+})

@@ -375,24 +375,51 @@ async function createRuleRequest(
   onSocket: (socket: Duplex) => void,
 ): Promise<{ transport: typeof http | typeof https, options: OutgoingRequestOptions }> {
   const outgoingHeaders = { ...headers, connection: 'close' }
+  const targetHost = stripIpv6Brackets(target.hostname)
   const targetTransport = target.protocol === 'https:' ? https : http
+  // A literal IP address is never a valid SNI value, and an IPv6 literal
+  // arrives from URL parsing wrapped in brackets.
+  const servername = net.isIP(targetHost) ? undefined : targetHost
+  const originForm = {
+    method,
+    host: targetHost,
+    port: targetPort(target),
+    path: `${target.pathname}${target.search}`,
+    headers: outgoingHeaders,
+  }
   if (rule.type === 'direct') {
     return {
       transport: targetTransport,
       options: {
-        method,
-        host: target.hostname,
-        port: targetPort(target),
-        path: `${target.pathname}${target.search}`,
-        headers: outgoingHeaders,
+        ...originForm,
         agent: false,
-        servername: net.isIP(target.hostname) ? undefined : target.hostname,
+        servername,
       },
     }
   }
 
   const endpoint = requireEndpoint(rule)
   if (rule.type === 'http' || rule.type === 'https') {
+    if (target.protocol === 'https:') {
+      // An absolute-URI HTTPS request must not be handed to the proxy in the
+      // clear: that would expose the request line, the headers and the body.
+      // Tunnel to the origin with CONNECT first, then run TLS over the tunnel.
+      const tunnel = await establishHttpProxyTunnel(
+        endpoint,
+        rule.type === 'https',
+        targetHost,
+        targetPort(target),
+      )
+      onSocket(tunnel)
+      return {
+        transport: https,
+        options: {
+          ...originForm,
+          agent: new TlsOverSocketAgent(tunnel, servername),
+          servername,
+        },
+      }
+    }
     return {
       transport: rule.type === 'https' ? https : http,
       options: {
@@ -408,19 +435,26 @@ async function createRuleRequest(
   }
 
   const socket = rule.type === 'socks4'
-    ? await connectSocks4(endpoint, target.hostname, targetPort(target))
-    : await connectSocks5(endpoint, target.hostname, targetPort(target))
+    ? await connectSocks4(endpoint, targetHost, targetPort(target))
+    : await connectSocks5(endpoint, targetHost, targetPort(target))
   onSocket(socket)
+  if (target.protocol === 'https:') {
+    // The SOCKS socket already reaches the origin; TLS still has to run on
+    // top of it, otherwise the request leaves the machine in the clear.
+    return {
+      transport: https,
+      options: {
+        ...originForm,
+        agent: new TlsOverSocketAgent(socket, servername),
+        servername,
+      },
+    }
+  }
   return {
-    transport: targetTransport,
+    transport: http,
     options: {
-      method,
-      host: target.hostname,
-      port: targetPort(target),
-      path: `${target.pathname}${target.search}`,
-      headers: outgoingHeaders,
+      ...originForm,
       agent: new SingleSocketAgent(socket),
-      servername: net.isIP(target.hostname) ? undefined : target.hostname,
     },
   }
 }
@@ -428,20 +462,21 @@ async function createRuleRequest(
 async function selectReachableRule(rules: SystemProxyRule[], target: URL): Promise<SystemProxyRule> {
   const errors: string[] = []
   const useTls = target.protocol === 'https:'
+  const targetHost = stripIpv6Brackets(target.hostname)
   for (const rule of rules) {
     let socket: Duplex | null = null
     try {
       if (rule.type === 'direct') {
         socket = useTls
-          ? await connectTls(target.hostname, targetPort(target))
-          : await connectTcp(target.hostname, targetPort(target))
+          ? await connectTls(targetHost, targetPort(target))
+          : await connectTcp(targetHost, targetPort(target))
       } else {
         const endpoint = requireEndpoint(rule)
         socket = rule.type === 'http' || rule.type === 'https'
           ? await connectProxyEndpoint(endpoint, rule.type === 'https')
           : rule.type === 'socks4'
-            ? await connectSocks4(endpoint, target.hostname, targetPort(target))
-            : await connectSocks5(endpoint, target.hostname, targetPort(target))
+            ? await connectSocks4(endpoint, targetHost, targetPort(target))
+            : await connectSocks5(endpoint, targetHost, targetPort(target))
       }
       socket.destroy()
       return rule
@@ -492,6 +527,42 @@ class SingleSocketAgent extends http.Agent {
     if (this.claimed) throw new Error('System proxy route socket was already claimed')
     this.claimed = true
     return this.socket
+  }
+}
+
+// Runs TLS on top of an already connected socket (a proxy CONNECT tunnel or a
+// SOCKS connection). The origin request therefore never reaches the proxy in
+// the clear, and the proxy only ever sees an opaque TLS stream.
+class TlsOverSocketAgent extends https.Agent {
+  private claimed = false
+
+  constructor(
+    private readonly socket: Duplex,
+    private readonly servername: string | undefined,
+  ) {
+    super({ keepAlive: false })
+  }
+
+  override createConnection(
+    _options: https.RequestOptions,
+    oncreate?: (error: Error | null, stream: Duplex) => void,
+  ): undefined {
+    if (this.claimed) {
+      oncreate?.(new Error('System proxy route socket was already claimed'))
+      return undefined
+    }
+    this.claimed = true
+    const secureSocket = tls.connect({ socket: this.socket as net.Socket, servername: this.servername })
+    const fail = (error: Error) => {
+      secureSocket.destroy()
+      oncreate?.(error)
+    }
+    secureSocket.once('error', fail)
+    secureSocket.once('secureConnect', () => {
+      secureSocket.removeListener('error', fail)
+      oncreate?.(null, secureSocket)
+    })
+    return undefined
   }
 }
 
@@ -697,6 +768,10 @@ function readFromSocket(
       socket.off('error', onError)
       socket.off('close', onClose)
       clearTimeout(timer)
+      // A socket without a 'data' listener keeps flowing, so bytes that
+      // arrive between two reads would be dropped. Pause it instead; the
+      // next read resumes it once its listener is attached.
+      socket.pause()
     }
     const onData = (chunk: Buffer) => {
       buffered = Buffer.concat([buffered, chunk])
@@ -728,6 +803,7 @@ function readFromSocket(
     socket.on('data', onData)
     socket.once('error', onError)
     socket.once('close', onClose)
+    socket.resume()
   })
 }
 

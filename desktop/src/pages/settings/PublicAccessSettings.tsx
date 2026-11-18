@@ -23,6 +23,9 @@ import { useTranslation } from '@/i18n'
 
 const CLOUDFLARE_DASHBOARD = 'https://dash.cloudflare.com/?to=/:account/tunnels'
 const CLOUDFLARE_GUIDE = 'https://developers.cloudflare.com/tunnel/get-started/'
+// A failed H5 origin sync is retried, because the status poll alone would
+// never try the same tunnel address again.
+const TUNNEL_ORIGIN_SYNC_RETRY_MS = 2000
 
 export function PublicAccessSettings() {
   const t = useTranslation()
@@ -87,6 +90,7 @@ export function PublicAccessSettings() {
   // online; the H5 settings are read from disk per request, so this applies
   // immediately — no server restart needed.
   const syncedTunnelOrigin = useRef<string | null>(null)
+  const tunnelOriginRetry = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
     const publicUrl = status?.state === 'online' ? status.publicUrl : undefined
     if (!publicUrl) return
@@ -98,20 +102,34 @@ export function PublicAccessSettings() {
     }
     if (syncedTunnelOrigin.current === origin) return
     syncedTunnelOrigin.current = origin
-    void (async () => {
+    let cancelled = false
+    const attempt = async (): Promise<void> => {
       try {
         await useSettingsStore.getState().fetchH5Access()
+        if (cancelled) return
         // A failed load falls back to stale in-memory settings; writing those
         // back could clobber origins added elsewhere, so skip the update.
-        if (useSettingsStore.getState().h5AccessError) return
+        if (useSettingsStore.getState().h5AccessError) throw new Error('H5 settings could not be loaded')
         const current = useSettingsStore.getState().h5Access.allowedOrigins
         if (current.includes(origin)) return
         await useSettingsStore.getState().updateH5AccessSettings({ allowedOrigins: [...current, origin] })
       } catch {
         // Best-effort: public access itself works without it; only the H5 page
-        // served through the tunnel needs the origin in allowedOrigins.
+        // served through the tunnel needs the origin in allowedOrigins. A
+        // transient failure is retried, because the status poll would not
+        // trigger another attempt for the same tunnel address.
+        if (cancelled) return
+        tunnelOriginRetry.current = setTimeout(() => { void attempt() }, TUNNEL_ORIGIN_SYNC_RETRY_MS)
       }
-    })()
+    }
+    void attempt()
+    return () => {
+      cancelled = true
+      if (tunnelOriginRetry.current) {
+        clearTimeout(tunnelOriginRetry.current)
+        tunnelOriginRetry.current = null
+      }
+    }
   }, [status?.state, status?.publicUrl])
   const run = useCallback(async (action: (generation: number) => Promise<unknown>) => {
     const generation = ++actionGeneration.current
