@@ -85,3 +85,6 @@ graphify-out/
 
 # Computer Use native helper build output (SwiftPM)
 native/cu-helper/.build/
+# >>> mcu-ai managed — 链接生成物，不入库 >>>
+**/.codebuddy/
+# <<< mcu-ai managed <<<

@@ -19,3 +19,18 @@ Object.assign(globalThis, {
 if (process.env.CALLER_DIR) {
   process.chdir(process.env.CALLER_DIR);
 }
+
+// cc-mods: start loading enabled mods early so tool.call interception and
+// classic event bridging are live before the session's first events.
+// Dynamic import after chdir so bootstrap state captures the real cwd.
+// Fire-and-forget: modsToolCall (static import in toolExecution.ts)
+// self-initializes the engine lazily even if this early load never runs.
+try {
+  void import('./src/mods/index.js')
+    .then(m => m.installMods())
+    .catch(() => {
+      // mods are additive — never block startup on them
+    })
+} catch {
+  // mods are additive — never block startup on them
+}

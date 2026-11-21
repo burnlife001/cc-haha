@@ -4259,6 +4259,16 @@ async function run(): Promise<CommanderCommand> {
     await pluginValidateHandler(manifestPath, options);
   });
 
+  // Plugin test command
+  pluginCmd.command('test [dir]').description("Run a plugin's *.test.ts files in the mod test environment").option('--write-types', 'Write .claude-plugin/types beside the plugin').action(async (dir: string | undefined, options: {
+    writeTypes?: boolean;
+  }) => {
+    const {
+      pluginTestCli
+    } = await import('./mods/testing/command.js');
+    await pluginTestCli(dir, options);
+  });
+
   // Plugin list command
   pluginCmd.command('list').description('List installed plugins').option('--json', 'Output as JSON').option('--available', 'Include available plugins from marketplaces (requires --json)').addOption(coworkOption()).action(async (options: {
     json?: boolean;

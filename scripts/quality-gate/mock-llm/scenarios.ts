@@ -6,7 +6,7 @@
  * the failure paths a real provider cannot be made to produce on demand.
  */
 
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import { PROVIDER_PRESETS } from '../../../src/server/config/providerPresets'
@@ -32,6 +32,7 @@ import { runWorktreeSession } from './worktreeSession'
 export type MockAgentScenario = { id: string; title: string }
 
 export const MOCK_ONLY_SCENARIOS: readonly MockAgentScenario[] = [
+  { id: 'mock-mods-agent-intercept', title: 'A cc-mods tool.call hook replaces an Agent call with the mod result and no native subagent spawns' },
   { id: 'mock-provider-subagent-model', title: 'Provider JSON subagent models survive save and reach real child requests in new sessions' },
   { id: 'mock-worktree-session', title: 'Enter/ExitWorktree synchronizes the same turn, reconnect, Git and persisted session without changing other sessions' },
   { id: 'mock-glob-absolute-permissions', title: 'Absolute Glob roots require approval and denied enumeration recovers on the next workspace turn' },
@@ -134,6 +135,100 @@ export function createMockOnlyRunners(
   searchRequests: MockLlmServer['searchRequests'] = [],
 ): Record<string, LiveScenarioRunner> {
   return {
+    // cc-mods: a plugin's tool.call hook must fire inside the real CLI and
+    // substitute its own result for the Agent call, so no native subagent
+    // (original model) is ever spawned. The fixture mod is staged into the
+    // sandbox CLAUDE_CONFIG_DIR exactly like an installed plugin.
+    async 'mock-mods-agent-intercept'(ctx) {
+      const pluginRoot = join(ctx.configDir, 'plugins', 'cache', 'fixture-mods', 'subagentmods', '0.0.0')
+      mkdirSync(join(pluginRoot, 'hooks'), { recursive: true })
+      mkdirSync(join(pluginRoot, '.claude-plugin'), { recursive: true })
+      writeFileSync(join(pluginRoot, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'subagentmods' }))
+      writeFileSync(join(pluginRoot, 'hooks', 'hooks.json'), JSON.stringify({ modules: ['./register.js'] }))
+      writeFileSync(join(pluginRoot, 'hooks', 'register.js'), `export function register(on) {
+  on('tool.call', { tool: 'Agent' }, async ($, e) => ({
+    result: {
+      agentId: 'fixture-minimax-worker',
+      content: [{ type: 'text', text: 'FIXTURE_MINIMAX_REPLY' }],
+      totalToolUseCount: 0,
+      totalDurationMs: 1,
+      totalTokens: 0,
+      status: 'completed',
+      prompt: typeof e.prompt === 'string' ? e.prompt : '',
+      resolvedModel: 'fixture-minimax-m3',
+    },
+  }))
+}
+`)
+      const settingsPath = join(ctx.configDir, 'settings.json')
+      let settings: Record<string, unknown> = {}
+      try { settings = JSON.parse(readFileSync(settingsPath, 'utf8')) } catch { /* absent — start empty */ }
+      const enabledPlugins = {
+        ...((settings.enabledPlugins as Record<string, boolean> | undefined) ?? {}),
+        'subagentmods@fixture-mods': true,
+      }
+      writeFileSync(settingsPath, JSON.stringify({ ...settings, enabledPlugins }, null, 2))
+      const installedPath = join(ctx.configDir, 'plugins', 'installed_plugins.json')
+      let installed: Record<string, unknown> = {}
+      try { installed = JSON.parse(readFileSync(installedPath, 'utf8')) } catch { /* absent — start empty */ }
+      const installedPlugins = {
+        ...((installed.plugins as Record<string, unknown> | undefined) ?? {}),
+        'subagentmods@fixture-mods': [{ scope: 'user', installPath: pluginRoot }],
+      }
+      writeFileSync(installedPath, JSON.stringify({ ...installed, version: installed.version ?? 2, plugins: installedPlugins }, null, 2))
+
+      const sessionId = await ctx.createSession()
+      const socket = await ctx.openSocket(sessionId)
+      try {
+        ctx.pinRuntime(socket)
+        socket.send({ type: 'set_permission_mode', mode: 'bypassPermissions' })
+        const since = requests.length
+        socket.send({
+          type: 'user_message',
+          content: `MOCK_TEAM_OWNER ${JSON.stringify({
+            tool: 'Agent',
+            input: { subagent_type: 'general-purpose', description: 'fixture delegation', prompt: 'FIXTURE_DELEGATED_TASK' },
+          })}`,
+        })
+        const completed = await socket.waitFor(message => message.type === 'message_complete', ctx.stepTimeoutMs, 'mods-intercepted Agent turn')
+        if (completed.type !== 'message_complete') {
+          throw new Error(`Agent turn did not complete: ${JSON.stringify(completed)}`)
+        }
+        const results = toolResultsSentUpstream(requests, since)
+        if (!results.some(result => !result.is_error && contentText(result.content).includes('FIXTURE_MINIMAX_REPLY'))) {
+          throw new Error(`Agent call was not replaced by the cc-mods fixture result: ${JSON.stringify(results)}`)
+        }
+        const childRequests = requests.slice(since).filter(item => {
+          const content = item.body.messages?.findLast(message => message.role === 'user')?.content
+          // A native subagent's first request carries the task as its whole user
+          // TEXT (exact match — the parent's own first request embeds the task
+          // inside the MOCK_TEAM_OWNER JSON, and its last request embeds it in a
+          // tool_result, so `includes` false-positives on the parent chain).
+          const isTaskText = typeof content === 'string'
+            ? content.trim() === 'FIXTURE_DELEGATED_TASK'
+            : Array.isArray(content) && content.some(block =>
+                block && typeof block === 'object' && (block as { type?: string }).type === 'text' &&
+                String((block as { text?: unknown }).text ?? '').trim() === 'FIXTURE_DELEGATED_TASK')
+          return isTaskText && (item.body.tools?.length ?? 0) > 0
+        })
+        if (childRequests.length > 0) {
+          throw new Error('cc-mods interception did not prevent the native subagent spawn')
+        }
+        writeFileSync(join(ctx.artifactDir, 'mods-agent-intercept.json'), JSON.stringify({
+          intercepted: true,
+          nativeSubagentSpawned: false,
+        }, null, 2))
+      } catch (error) {
+        // The lane's teardown can hang on Windows before the harness prints the
+        // failure — persist the assertion error so a rerun is diagnosable.
+        writeFileSync(join(ctx.artifactDir, 'mods-agent-intercept.error.txt'),
+          error instanceof Error ? (error.stack ?? error.message) : String(error))
+        throw error
+      } finally {
+        socket.close()
+      }
+    },
+
     async 'mock-provider-subagent-model'(ctx) {
       const endpoint = `${ctx.baseUrl}/api/providers`
       const settingsPath = join(ctx.configDir, 'cc-haha', 'settings.json')

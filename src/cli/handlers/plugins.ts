@@ -43,6 +43,7 @@ import {
   saveMarketplaceToSettings,
 } from '../../utils/plugins/marketplaceManager.js'
 import { loadPluginMcpServers } from '../../utils/plugins/mcpPluginIntegration.js'
+import { validateModDir } from '../../mods/testing/validate.js'
 import { parseMarketplaceInput } from '../../utils/plugins/parseMarketplaceInput.js'
 import {
   parsePluginIdentifier,
@@ -115,10 +116,12 @@ export async function pluginValidateHandler(
     // hooks). Works whether the user passed a directory or the plugin.json
     // path directly.
     let contentResults: ValidationResult[] = []
+    let pluginDir: string | null = null
     if (result.fileType === 'plugin') {
       const manifestDir = dirname(result.filePath)
       if (basename(manifestDir) === '.claude-plugin') {
-        contentResults = await validatePluginContents(dirname(manifestDir))
+        pluginDir = dirname(manifestDir)
+        contentResults = await validatePluginContents(pluginDir)
         for (const r of contentResults) {
           // biome-ignore lint/suspicious/noConsole:: intentional console output
           console.log(`Validating ${r.fileType}: ${r.filePath}\n`)
@@ -127,10 +130,32 @@ export async function pluginValidateHandler(
       }
     }
 
-    const allSuccess = result.success && contentResults.every(r => r.success)
+    // A plugin whose hooks/hooks.json names `modules` is a mod: check that the
+    // engine could load it (module present, no dynamic import, register
+    // exported, every event and $ noun call it names is in the contract).
+    const modResult = pluginDir ? await validateModDir(pluginDir) : null
+    if (modResult) {
+      // biome-ignore lint/suspicious/noConsole:: intentional console output
+      console.log(`Validating hooks module: ${modResult.filePath}\n`)
+      printValidationResult(modResult)
+      for (const note of modResult.notes) {
+        // biome-ignore lint/suspicious/noConsole:: intentional console output
+        console.log(`  ${figures.pointer} ${note}`)
+      }
+      if (modResult.notes.length > 0) {
+        // biome-ignore lint/suspicious/noConsole:: intentional console output
+        console.log('')
+      }
+    }
+
+    const allSuccess =
+      result.success &&
+      contentResults.every(r => r.success) &&
+      (modResult?.success ?? true)
     const hasWarnings =
       result.warnings.length > 0 ||
-      contentResults.some(r => r.warnings.length > 0)
+      contentResults.some(r => r.warnings.length > 0) ||
+      (modResult?.warnings.length ?? 0) > 0
 
     if (allSuccess) {
       cliOk(

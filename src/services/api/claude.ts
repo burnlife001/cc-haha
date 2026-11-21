@@ -23,6 +23,7 @@ import type {
 import type { TextBlockParam } from "@anthropic-ai/sdk/resources/index.mjs";
 import type { Stream } from "@anthropic-ai/sdk/streaming.mjs";
 import { randomUUID } from "crypto";
+import { modsEmitSessionMeasure } from "../../mods/index.js";
 import {
   getAPIProvider,
   isFirstPartyAnthropicBaseUrl,
@@ -3554,6 +3555,13 @@ async function* queryModel(
         fallbackUsage,
         options.model,
       );
+    }
+
+    // One `session.measure` per answered request, after usage is on the
+    // ledger. Fire-and-forget: the mods engine must never hold the turn open,
+    // and its own dispatch drops the event when no mod watches it.
+    if (hasStreamingUsage || fallbackMessage) {
+      void modsEmitSessionMeasure().catch(() => {});
     }
   }
 

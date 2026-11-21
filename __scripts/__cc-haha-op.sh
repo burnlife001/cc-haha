@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(builtin cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null 2>&1 && pwd -P)"
+REPO_ROOT="$(builtin cd "$SCRIPT_DIR/.." > /dev/null 2>&1 && pwd -P)"
+cd "$REPO_ROOT"
+
+# ── Configurable remotes ─────────────────────────────────────────────────────
+UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
+ORIGIN_REMOTE="${ORIGIN_REMOTE:-origin}"
+
+BUILD_SCRIPT="$REPO_ROOT/desktop/scripts/build-windows-x64.ps1"
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+red()    { echo -e "\033[31m$*\033[0m"; }
+green()  { echo -e "\033[32m$*\033[0m"; }
+yellow() { echo -e "\033[33m$*\033[0m"; }
+cyan()   { echo -e "\033[36m$*\033[0m"; }
+
+# ── 备份 / 还原"仅本分支拥有"的文件 ──────────────────────────────────────────
+# 切分支时 git 会删除这些文件。Windows 上目录被进程占用时 rmdir 会失败，
+# git 报 "Deletion of directory 'xxx' failed" 并中断 checkout，文件就真丢了。
+# 同步前先备份，结束后校验还原。
+backup_branch_only_files() {
+  local base="$1" dest="$2" file
+  mkdir -p "$dest"
+  : > "$dest/.manifest"
+  # git diff 失败时必须报错：清单为空 = 备份失效 = 文件可能真丢
+  if ! git diff --name-only --diff-filter=A "$base" HEAD -- > "$dest/.files" 2>/dev/null; then
+    red "git diff 失败，无法列出分支独有文件。"
+    rm -f "$dest/.files"
+    return 1
+  fi
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    [ -e "$file" ] || [ -L "$file" ] || continue
+    mkdir -p "$dest/$(dirname "$file")"
+    cp -Pp "$file" "$dest/$file"
+    printf '%s\n' "$file" >> "$dest/.manifest"
+  done < "$dest/.files"
+  rm -f "$dest/.files"
+  return 0
+}
+
+restore_branch_only_files() {
+  local dest="$1" file
+  [ -f "$dest/.manifest" ] || return 0
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if [ ! -e "$file" ] && [ ! -L "$file" ] &&
+       { [ -e "$dest/$file" ] || [ -L "$dest/$file" ]; }; then
+      mkdir -p "$(dirname "$file")"
+      cp -Pp "$dest/$file" "$file"
+      yellow "已还原被误删的文件: $file"
+    fi
+  done < "$dest/.manifest"
+}
+
+# 只有站在原分支上才允许把备份文件放回工作区：
+# 否则会把文件还原成 main 上的未跟踪文件，反而卡住之后的 checkout。
+restore_branch_only_files_if_on_branch() {
+  local dest="$1" branch="$2"
+  if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "$branch" ]; then
+    restore_branch_only_files "$dest"
+  else
+    yellow "当前不在 $branch 上，备份文件保留在: $dest"
+  fi
+}
+
+# 还原 stash；失败时明确告知（stash 仍留在列表里）
+restore_stash() {
+  local stashed="$1"
+  [ "$stashed" = true ] || return 0
+  echo "Restoring stashed changes..."
+  if ! git stash pop; then
+    red "stash pop 失败，stash 仍保留在列表里，请手动执行 git stash pop。"
+    return 1
+  fi
+  return 0
+}
+
+# ── Sync upstream ────────────────────────────────────────────────────────────
+sync_upstream() {
+  # 1. Check upstream remote exists, auto-add if missing
+  if ! git remote get-url "$UPSTREAM_REMOTE" > /dev/null 2>&1; then
+    yellow "Remote '$UPSTREAM_REMOTE' not found. Adding..."
+    git remote add "$UPSTREAM_REMOTE" git@github.com:NanmiCoder/cc-haha.git
+  fi
+
+  # 2. Check origin remote exists
+  if ! git remote get-url "$ORIGIN_REMOTE" > /dev/null 2>&1; then
+    red "Error: remote '$ORIGIN_REMOTE' not found."
+    return 1
+  fi
+
+  # 3. Stash if worktree is dirty (只统计已跟踪文件：未跟踪文件 stash push 存不了)
+  local stashed=false
+  local stash_count_before
+  stash_count_before="$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
+  if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    yellow "Worktree is dirty. Stashing changes..."
+    if ! git stash push -m "auto: stash before sync $(date '+%Y-%m-%d %H:%M:%S')"; then
+      red "stash 失败，同步已中止。"
+      return 1
+    fi
+    local stash_count_after
+    stash_count_after="$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$stash_count_after" -gt "$stash_count_before" ]; then
+      stashed=true
+    else
+      yellow "没有真正产生 stash（改动无法被 stash），继续同步。"
+    fi
+  fi
+
+  # 4. Determine original branch
+  local original_branch
+  local current_branch
+  current_branch="$(git rev-parse --abbrev-ref HEAD)"
+  local all_branches
+  all_branches=$(git branch --list --format='%(refname:short)')
+
+  # If only on main with no other local branches, create a new branch
+  if [ "$current_branch" = "main" ] && [ -z "$(echo "$all_branches" | grep -v '^main$')" ]; then
+    local new_branch="feature/sync-$(date '+%Y%m%d')"
+    yellow "Only main branch found. Creating new branch: $new_branch"
+    if ! git checkout -b "$new_branch"; then
+      red "创建分支 $new_branch 失败，同步已中止。"
+      restore_stash "$stashed" || true
+      return 1
+    fi
+    git add -A
+    if ! git commit -m "chore: initial commit on $new_branch"; then
+      red "初始提交失败，同步已中止。"
+      restore_stash "$stashed" || true
+      return 1
+    fi
+    original_branch="$new_branch"
+  else
+    original_branch="$current_branch"
+  fi
+
+  # 5. Checkout main, fetch upstream, merge
+  echo "[1/4] Fetching $UPSTREAM_REMOTE..."
+  if ! git fetch "$UPSTREAM_REMOTE"; then
+    red "fetch $UPSTREAM_REMOTE 失败，同步已中止。"
+    restore_stash "$stashed" || true
+    return 1
+  fi
+
+  # 备份本分支独有文件（切分支时可能被删）
+  local backup_dir
+  backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/cc-haha-sync-XXXXXX")"
+  if ! backup_branch_only_files main "$backup_dir"; then
+    red "备份分支独有文件失败，为安全起见中止同步。"
+    rm -rf "$backup_dir"
+    restore_stash "$stashed" || true
+    return 1
+  fi
+
+  echo "[2/4] Checking out main and merging $UPSTREAM_REMOTE/main..."
+  if ! git checkout main; then
+    red "切换到 main 失败（通常是目录被占用）。"
+    git reset --hard HEAD || true
+    if git checkout "$original_branch"; then
+      restore_branch_only_files "$backup_dir"
+      restore_stash "$stashed" || true
+    else
+      red "切回 $original_branch 也失败，请手动恢复。"
+      echo "  备份文件保留在: $backup_dir"
+      echo "  你的改动保留在 stash 里（git stash list 查看）"
+    fi
+    return 1
+  fi
+  if ! git merge "$UPSTREAM_REMOTE/main" --no-edit; then
+    red "合并 $UPSTREAM_REMOTE/main 失败（多半是冲突）。已中止合并。"
+    git merge --abort || true
+    if git checkout "$original_branch"; then
+      restore_branch_only_files "$backup_dir"
+      restore_stash "$stashed" || true
+    else
+      red "切回 $original_branch 失败，请手动恢复。"
+      echo "  备份文件保留在: $backup_dir"
+      echo "  你的改动保留在 stash 里（git stash list 查看）"
+    fi
+    echo "  手动解决方式:"
+    echo "    git checkout main && git merge $UPSTREAM_REMOTE/main"
+    echo "    解决冲突后 git commit，再执行 git checkout $original_branch && git rebase main"
+    return 1
+  fi
+
+  # 6. Push to origin
+  echo "[3/4] Pushing to $ORIGIN_REMOTE..."
+  local push_failed=false
+  if ! git push "$ORIGIN_REMOTE" main; then
+    red "推送 main 失败（本地合并已保留）。"
+    push_failed=true
+  fi
+
+  # 7. Checkout original branch and rebase onto main
+  echo "[4/4] Rebasing $original_branch onto main..."
+  if ! git checkout "$original_branch"; then
+    red "切回 $original_branch 失败。"
+    echo "  备份文件保留在: $backup_dir"
+    echo "  你的改动保留在 stash 里（git stash list 查看）"
+    return 1
+  fi
+  if ! git rebase main; then
+    red "Rebase failed. Resolve conflicts, then run:"
+    echo "  git rebase --continue   (或 git rebase --abort)"
+    echo "  git stash pop            (如果之前有 stash)"
+    # rebase 还在进行中：此时把备份文件放回工作区会变成未跟踪文件，
+    # 反而让 git rebase --continue 失败，所以只提示、不还原。
+    echo "  备份文件保留在: $backup_dir（rebase 完成后会随提交自动恢复，无需手动还原）"
+    return 1
+  fi
+
+  # 8. Pop stash if we stashed
+  local stash_failed=false
+  restore_stash "$stashed" || stash_failed=true
+
+  # 9. 兜底：确认本分支独有文件都还在
+  restore_branch_only_files_if_on_branch "$backup_dir" "$original_branch"
+  rm -rf "$backup_dir"
+
+  if [ "$push_failed" = true ]; then
+    red "同步结束，但 main 未推送到 $ORIGIN_REMOTE。"
+    return 1
+  fi
+  if [ "$stash_failed" = true ]; then
+    red "同步结束，但 stash 未自动还原（见上方提示）。"
+    return 1
+  fi
+
+  green "Sync complete."
+}
+
+# ── Build exe ────────────────────────────────────────────────────────────────
+build_exe() {
+  # 用本地已下载的 electron zip 预置 @electron/get 缓存，跳过慢速下载。
+  # 缓存结构: <electronDownload.cache>/<sha256(下载URL目录名)>/<zip文件名>
+  local electron_ver
+  electron_ver="$(node -p "require('$(cygpath -m "$REPO_ROOT")/desktop/node_modules/electron/package.json').version" 2>/dev/null)"
+  local zip_name="electron-v${electron_ver}-win32-x64.zip"
+  local src_zip="E:/__work/BaseTools/electron/${zip_name}"
+  if [ -f "$src_zip" ] && [ -n "$electron_ver" ]; then
+    local url_dir="https://github.com/electron/electron/releases/download/v${electron_ver}"
+    local hash
+    hash="$(node -e "console.log(require('crypto').createHash('sha256').update('$url_dir').digest('hex'))")"
+    local cache_root="E:/__work/BaseTools/electron/electron-cache"
+    local dst_zip="$cache_root/$hash/$zip_name"
+    mkdir -p "$cache_root/$hash"
+    rm -f "$dst_zip"
+    if ! MSYS=winsymlinks:nativestrict ln -s "$src_zip" "$dst_zip"; then
+      red "[build-exe] 创建 electron 缓存符号链接失败: $dst_zip -> $src_zip"
+      read -r -p "按回车继续..."
+      return 1
+    fi
+    green "[build-exe] electron 缓存就绪: $dst_zip"
+  else
+    red "[build-exe] 未找到本地 electron zip: $src_zip"
+    read -r -p "按回车继续..."
+    return 1
+  fi
+
+  echo "[build-exe] Installing adapters dependencies..."
+  (cd "$REPO_ROOT/adapters" && bun install)
+  if [ $? -ne 0 ]; then
+    red "[build-exe] Failed to install adapters dependencies"
+    return 1
+  fi
+
+  echo "[build-exe] 执行 PowerShell 构建脚本..."
+  if command -v pwsh > /dev/null 2>&1; then
+    pwsh -ExecutionPolicy Bypass -File "$BUILD_SCRIPT"
+  elif command -v powershell > /dev/null 2>&1; then
+    powershell -ExecutionPolicy Bypass -File "$BUILD_SCRIPT"
+  else
+    red "错误：未找到 pwsh 或 powershell"
+    return 1
+  fi
+}
+
+# ── Update electron-builder ──────────────────────────────────────────────────
+update_builder() {
+  echo "[update-builder] Updating electron-builder in desktop/ ..."
+  (cd "$REPO_ROOT/desktop" && bun update electron-builder)
+  if [ $? -ne 0 ]; then
+    red "[update-builder] Failed to update electron-builder"
+    return 1
+  fi
+  local ver
+  ver="$(node -p "require('$REPO_ROOT/desktop/node_modules/electron-builder/package.json').version" 2>/dev/null)"
+  green "[update-builder] electron-builder is now at ${ver:-unknown}"
+}
+
+# ── Dev mode: desktop IDE ────────────────────────────────────────────────────
+# 桌面 dev 跑的 server / 会话 CLI 是编译产物 claude-sidecar-*.exe，
+# 不是工作树源码；src/ 或 desktop/sidecars/ 比 exe 新时提示先重编（菜单 6）。
+SIDECAR_EXE="$REPO_ROOT/desktop/src-tauri/binaries/claude-sidecar-x86_64-pc-windows-msvc.exe"
+
+check_sidecar_freshness() {
+  if [ ! -f "$SIDECAR_EXE" ]; then
+    red "[dev-ide] 缺 sidecar: $SIDECAR_EXE"
+    red "[dev-ide] 桌面无法启动，请先跑菜单 6. rebuild-sidecars"
+    return 1
+  fi
+  local stale
+  stale="$(find "$REPO_ROOT/src" "$REPO_ROOT/desktop/sidecars" \
+      "$REPO_ROOT/preload.ts" "$REPO_ROOT/bunfig.toml" \
+      -type f -newer "$SIDECAR_EXE" 2>/dev/null | head -5)"
+  if [ -n "$stale" ]; then
+    yellow "[dev-ide] 以下源码比 sidecar exe 新（$(echo "$stale" | wc -l | tr -d ' ') 处，前 5 条）:"
+    echo "$stale" | sed 's/^/    /'
+    yellow "[dev-ide] 桌面跑的仍是旧 exe；改 mods/src 后请先跑菜单 6. rebuild-sidecars，否则改动不生效"
+  fi
+  return 0
+}
+
+dev_ide() {
+  check_sidecar_freshness || return 1
+  green "[dev-ide] 启动桌面开发模式 (electron:dev)..."
+  unset CALLER_DIR
+  (cd "$REPO_ROOT/desktop" && bun run electron:dev)
+}
+
+# ── Rebuild desktop sidecar ──────────────────────────────────────────────────
+# Bun --compile 无增量缓存，每次全量重编（约几分钟）。改了 src/mods 等
+# 工作树源码后，桌面（菜单 5）要重编 sidecar 才生效；CLI (bun run start) 不需要。
+rebuild_sidecars() {
+  green "[rebuild-sidecars] 全量重编 claude-sidecar（Bun --compile 无增量，约几分钟）..."
+  unset CALLER_DIR
+  (cd "$REPO_ROOT/desktop" && bun run build:sidecars)
+}
+
+# ── Trigger GitHub Windows build ─────────────────────────────────────────────
+gh_windows_build() {
+  if ! command -v gh > /dev/null 2>&1; then
+    red "错误：未找到 gh CLI"
+    return 1
+  fi
+  local platform="${1:-windows-x64}"
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  yellow "[gh-build] Triggering 'Build Desktop (Dev)' on $branch, platform=$platform ..."
+  gh workflow run build-desktop-dev.yml \
+    --repo burnlife001/cc-haha \
+    --ref "$branch" \
+    -f platforms="$platform"
+  if [ $? -ne 0 ]; then
+    red "[gh-build] workflow dispatch failed"
+    return 1
+  fi
+  green "[gh-build] Dispatched. Watch at: https://github.com/burnlife001/cc-haha/actions"
+}
+
+# ── Menu ─────────────────────────────────────────────────────────────────────
+show_menu() {
+  clear
+  echo "========== cc-haha menu =========="
+  echo "1. sync-upstream (fetch → merge → push → rebase)"
+  echo "2. build-exe"
+  echo "3. update electron-builder"
+  echo "4. gh-windows-build (触发 GitHub Windows 编译)"
+  echo "5. dev-ide (开发模式启动桌面 IDE)"
+  echo "6. rebuild-sidecars (改 src/mods 后重编桌面 sidecar)"
+  echo "0. exit"
+  echo "=================================="
+}
+# ── Main ─────────────────────────────────────────────────────────────────────
+main() {
+  case "${1:-}" in
+    sync|1)
+      sync_upstream
+      ;;
+    build|2)
+      build_exe
+      ;;
+    ub|3)
+      update_builder
+      ;;
+    ghb|4)
+      gh_windows_build "$2"
+      ;;
+    dev-ide|ide|5)
+      dev_ide
+      ;;
+    sidecars|6)
+      rebuild_sidecars
+      ;;
+    *)
+      while true; do
+        show_menu
+        read -r -p "请选择: " choice || { echo ""; exit 0; }
+        case "$choice" in
+          1) sync_upstream ;;
+          2) build_exe ;;
+          3) update_builder ;;
+          4) gh_windows_build ;;
+          5) dev_ide ;;
+          6) rebuild_sidecars ;;
+          0) echo "Bye."; exit 0 ;;
+          *) red "无效选项，请重新输入。" ;;
+        esac
+
+        if [ "$choice" != "0" ]; then
+          echo ""
+          read -r -p "按 Enter 继续..."
+        fi
+      done
+      ;;
+  esac
+}
+
+main "$@"

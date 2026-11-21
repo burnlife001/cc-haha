@@ -1,5 +1,6 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import addDir from './commands/add-dir/index.js'
+import { modsLocalCommands } from './mods/index.js'
 import autofixPr from './commands/autofix-pr/index.js'
 import backfillSessions from './commands/backfill-sessions/index.js'
 import btw from './commands/btw/index.js'
@@ -510,7 +511,12 @@ const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
  * auth changes (e.g. /login) take effect immediately.
  */
 export async function getCommands(cwd: string): Promise<Command[]> {
-  const allCommands = await loadAllCommands(cwd)
+  const allCommands = [
+    ...(await loadAllCommands(cwd)),
+    // cc-mods: slash commands a mod registered at runtime (one-line seam —
+    // see src/mods/INTEGRATION.md).
+    ...modsLocalCommands(),
+  ]
 
   // Get dynamic skills discovered during file operations
   const dynamicSkills = getDynamicSkills()

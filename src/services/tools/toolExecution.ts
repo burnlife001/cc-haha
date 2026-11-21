@@ -1,4 +1,5 @@
 import { feature } from 'bun:bundle'
+import { modsToolCall } from 'src/mods/index.js'
 import type {
   ContentBlockParam,
   ToolResultBlockParam,
@@ -636,6 +637,41 @@ async function checkPermissionsAndCallTool(
     progress: ToolProgress<ToolProgressData> | ProgressMessage<HookProgress>,
   ) => void,
 ): Promise<MessageUpdateLazy[]> {
+  // cc-mods in-process interception (tool.call): a mod may deny the call or
+  // substitute a synthetic result before any validation or permission work.
+  // Null outcome means no mod watched this call — zero overhead thereafter.
+  const modsOutcome = await modsToolCall({
+    tool: tool.name,
+    toolUseID,
+    input: input as Record<string, unknown>,
+  })
+  if (modsOutcome) {
+    const modsContent =
+      modsOutcome.kind === 'deny'
+        ? `<tool_use_error>${modsOutcome.reason}</tool_use_error>`
+        : flattenModsResult(modsOutcome.result)
+    return [
+      {
+        message: createUserMessage({
+          content: [
+            {
+              type: 'tool_result',
+              content: modsContent,
+              is_error: modsOutcome.kind === 'deny',
+              tool_use_id: toolUseID,
+            },
+          ],
+          toolUseResult:
+            modsOutcome.kind === 'deny'
+              ? modsOutcome.reason
+              : String(modsContent).slice(0, 2000),
+          durationMs: 0,
+          sourceToolAssistantUUID: assistantMessage.uuid,
+        }),
+      },
+    ]
+  }
+
   // Validate input types with zod (surprisingly, the model is not great at generating valid input)
   const parsedInput = tool.inputSchema.safeParse(input)
   if (!parsedInput.success) {
@@ -1775,4 +1811,23 @@ async function checkPermissionsAndCallTool(
       toolUseContext.toolDecisions?.delete(toolUseID)
     }
   }
+}
+
+// cc-mods: flatten a synthetic tool result into tool_result content. Text
+// blocks concatenate; anything else serializes as JSON so no mod-supplied
+// field is silently dropped.
+function flattenModsResult(result: Record<string, unknown>): string {
+  const blocks = Array.isArray(result.content) ? result.content : []
+  const text = blocks
+    .map(block =>
+      block && typeof block === 'object' && 'text' in block
+        ? String((block as { text: unknown }).text)
+        : JSON.stringify(block),
+    )
+    .join('\n')
+  const rest = Object.fromEntries(
+    Object.entries(result).filter(([key]) => key !== 'content'),
+  )
+  if (Object.keys(rest).length === 0) return text
+  return `${text}\n\n${JSON.stringify(rest)}`
 }

@@ -1,5 +1,6 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { type as osType, version as osVersion, release as osRelease } from 'os'
+import { modsComposePromptSections } from '../mods/index.js'
 import { getAgentProfile } from '../utils/agentProfile.js'
 import { buildLeanSystemPrompt } from './leanPrompt.js'
 import { env } from '../utils/env.js'
@@ -576,7 +577,9 @@ ${CYBER_RISK_INSTRUCTION}`,
   const resolvedDynamicSections =
     await resolveSystemPromptSections(dynamicSections)
 
-  return [
+  // cc-mods: emit prompt.compose with the assembled sections; a mod may
+  // return a replacement array of sections.
+  const modsSections = await modsComposePromptSections([
     // --- Static content (cacheable) ---
     getSimpleIntroSection(outputStyleConfig),
     getSimpleSystemSection(),
@@ -592,7 +595,9 @@ ${CYBER_RISK_INSTRUCTION}`,
     ...(shouldUseGlobalCacheScope() ? [SYSTEM_PROMPT_DYNAMIC_BOUNDARY] : []),
     // --- Dynamic content (registry-managed) ---
     ...resolvedDynamicSections,
-  ].filter(s => s !== null)
+  ].filter(s => s !== null))
+
+  return modsSections
 }
 
 function getMcpInstructions(mcpClients: MCPServerConnection[]): string | null {
