@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import {
   Check,
   ChevronDown,
@@ -17,6 +17,8 @@ import { useTranslation } from '../../i18n'
 import { Badge, StatusDot } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { ModelSelector } from '../controls/ModelSelector'
+import { isSideChatSession } from '@/lib/sideChatSessions'
+import { ANTIGRAVITY_ACP_PROVIDER_ID } from '@/constants/antigravityAcp'
 import { resolveDefaultRuntimeSelection } from '../../lib/runtimeSelection'
 import type { RuntimeSelection } from '../../types/runtime'
 import type { PermissionUpdate } from '../../types/chat'
@@ -87,6 +89,8 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
   const respondToPermission = useChatStore((s) => s.respondToPermission)
   const activeTabId = useTabStore((s) => s.activeTabId)
   const targetSessionId = sessionId ?? activeTabId
+  const isAntigravity = useSessionRuntimeStore((state) => !!targetSessionId &&
+    state.selections[targetSessionId]?.providerId === ANTIGRAVITY_ACP_PROVIDER_ID)
   const pendingPermission = useChatStore((s) => targetSessionId
     ? getPendingPermission(s.sessions[targetSessionId], requestId)
     : undefined)
@@ -94,7 +98,7 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
   const isPending = Boolean(pendingPermission)
   const [showRaw, setShowRaw] = useState(false)
 
-  if (isExitPlanModeTool(toolName)) {
+  if (!isAntigravity && isExitPlanModeTool(toolName)) {
     return (
       <ExitPlanModePermissionDialog
         sessionId={targetSessionId}
@@ -102,6 +106,8 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
         input={input}
         description={description}
         isPending={isPending}
+        submittingRuntime={Boolean(pendingPermission?.planRuntimeSubmission)}
+        runtimeError={pendingPermission?.planRuntimeError}
         markerWhenPending={markerWhenPending}
       />
     )
@@ -221,14 +227,16 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
         >
           {t('permission.allow')}
         </Button>
-        <Button
-          variant="secondary"
-          size="base"
-          aria-label={`${t('permission.allowForSession')}: ${permissionContext}`}
-          onClick={() => targetSessionId && respondToPermission(targetSessionId, requestId, true, { rule: 'always' })}
-        >
-          {t('permission.allowForSession')}
-        </Button>
+        {!isAntigravity && (
+          <Button
+            variant="secondary"
+            size="base"
+            aria-label={`${t('permission.allowForSession')}: ${permissionContext}`}
+            onClick={() => targetSessionId && respondToPermission(targetSessionId, requestId, true, { rule: 'always' })}
+          >
+            {t('permission.allowForSession')}
+          </Button>
+        )}
         <div className="flex-1" />
         <Button
           variant="ghost"
@@ -249,6 +257,8 @@ function ExitPlanModePermissionDialog({
   input,
   description,
   isPending,
+  submittingRuntime,
+  runtimeError,
   markerWhenPending,
 }: {
   sessionId?: string | null
@@ -256,8 +266,11 @@ function ExitPlanModePermissionDialog({
   input: unknown
   description?: string
   isPending: boolean
+  submittingRuntime: boolean
+  runtimeError?: string
   markerWhenPending: boolean
 }) {
+  const errorId = useId()
   const respondToPermission = useChatStore((s) => s.respondToPermission)
   const t = useTranslation()
   const [feedback, setFeedback] = useState('')
@@ -296,19 +309,13 @@ function ExitPlanModePermissionDialog({
     allowed: boolean,
     options?: { permissionUpdates?: PermissionUpdate[]; denyMessage?: string },
   ) => {
-    if (!sessionId) return
+    if (!sessionId || submittingRuntime) return
     const runtimeOverride = executionRuntime
       ? {
           providerId: executionRuntime.providerId,
           modelId: executionRuntime.modelId,
         }
       : undefined
-    if (runtimeOverride) {
-      // Local echo so the composer pill reflects the switch immediately; the
-      // server already received the override inside the permission_response,
-      // so deliberately do NOT also send set_runtime_config.
-      useSessionRuntimeStore.getState().setSelection(sessionId, runtimeOverride)
-    }
     const nextOptions = {
       ...options,
       ...(runtimeOverride ? { runtimeOverride } : {}),
@@ -387,6 +394,7 @@ function ExitPlanModePermissionDialog({
           onChange={(event) => setFeedback(event.target.value)}
           placeholder={t('permission.planFeedbackPlaceholder')}
           rows={3}
+          disabled={submittingRuntime}
           className="min-h-[72px] w-full resize-y rounded-[var(--radius-md)] border border-transparent bg-[var(--color-surface-container)] px-3 py-2.5 text-[13px] text-[var(--color-text-primary)] outline-none transition-colors placeholder:text-[var(--color-text-tertiary)] focus:border-[var(--color-outline)] focus:bg-[var(--color-surface-container-lowest)]"
         />
         <div className="flex items-center justify-between gap-3">
@@ -403,6 +411,8 @@ function ExitPlanModePermissionDialog({
               compact
               ariaLabel={t('permission.planExecutionModel')}
               runtimeSelection={executionRuntime ?? currentRuntime}
+              lockedProviderId={sessionId && isSideChatSession(sessionId) ? currentRuntime.providerId : undefined}
+              disabled={submittingRuntime}
               onRuntimeSelectionChange={handleExecutionRuntimeChange}
             />
             {executionRuntime ? (
@@ -412,12 +422,17 @@ function ExitPlanModePermissionDialog({
             ) : null}
           </div>
         </div>
+        {runtimeError && (
+          <p id={errorId} role="alert" className="text-xs text-[var(--color-text-secondary)]">{runtimeError}</p>
+        )}
       </div>
 
       <div className="flex flex-wrap items-center gap-2 px-4 pb-3.5 pt-3">
         <Button
           variant="primary"
           size="base"
+          disabled={submittingRuntime}
+          aria-describedby={runtimeError ? errorId : undefined}
           onClick={() => approve(permissionUpdates.length ? { permissionUpdates } : undefined)}
         >
           {t('permission.planApprove')}
@@ -425,6 +440,8 @@ function ExitPlanModePermissionDialog({
         <Button
           variant="secondary"
           size="base"
+          disabled={submittingRuntime}
+          aria-describedby={runtimeError ? errorId : undefined}
           onClick={() => approveWithMode('acceptEdits')}
         >
           {t('permission.planApproveAcceptEdits')}
@@ -432,6 +449,8 @@ function ExitPlanModePermissionDialog({
         <Button
           variant="danger-ghost"
           size="base"
+          disabled={submittingRuntime}
+          aria-describedby={runtimeError ? errorId : undefined}
           onClick={() => approveWithMode('bypassPermissions')}
         >
           {t('permission.planApproveBypass')}
@@ -440,6 +459,8 @@ function ExitPlanModePermissionDialog({
         <Button
           variant="ghost"
           size="base"
+          disabled={submittingRuntime}
+          aria-describedby={runtimeError ? errorId : undefined}
           onClick={keepPlanning}
         >
           {t('permission.planKeepPlanning')}

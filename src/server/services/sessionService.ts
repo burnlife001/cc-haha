@@ -1,4 +1,5 @@
 import { DesktopUiPreferencesService } from './desktopUiPreferencesService.js'
+import { ANTIGRAVITY_PROVIDER_ID } from './antigravityAcp.js'
 import { normalizeAdditionalDirectories, validateProjectAdditionalDirectories } from './projectDirectories.js'
 import { getSideChat, isSideChatId, sideChatSummary } from './sideChatRegistry.js'
 import { splitSessionReferenceContext } from './sessionReferenceContext.js'
@@ -65,6 +66,8 @@ import type { AssistantMessage } from '../../types/message.js'
 import { SYNTHETIC_MODEL } from '../../utils/messages.js'
 import { getTokenUsage, isUsableContextUsage } from '../../utils/tokens.js'
 import { ProviderService } from './providerService.js'
+import { OPENAI_OFFICIAL_PROVIDER_ID, isOpenAIOfficialProviderId } from './openaiOfficialProvider.js'
+import { GROK_OFFICIAL_PROVIDER_ID, isGrokOfficialProviderId } from './grokOfficialProvider.js'
 import { shouldHideCommandMetadataContent } from '../../utils/commandMetadata.js'
 import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 import { getSettings_DEPRECATED } from '../../utils/settings/settings.js'
@@ -222,6 +225,7 @@ export type SessionLaunchInfo = {
   runtimeModelId?: string
   effortLevel?: string
   openAIFastMode?: boolean
+  antigravitySessionId?: string
 }
 
 type SessionMetadataPatch = {
@@ -234,6 +238,7 @@ type SessionMetadataPatch = {
   runtimeModelId?: string
   effortLevel?: string
   openAIFastMode?: boolean
+  antigravitySessionId?: string
 }
 
 type ProviderContextWindowHint = Pick<SessionLaunchInfo, 'runtimeProviderId' | 'runtimeModelId'>
@@ -1260,16 +1265,7 @@ export class SessionService {
 
   private metadataMatchesLaunchInfo(
     launchInfo: SessionLaunchInfo | null,
-    metadata: {
-      workDir: string
-      repository?: PreparedSessionWorkspace['repository']
-      additionalDirectories?: string[]
-      permissionMode?: string
-      runtimeProviderId?: string | null
-      runtimeModelId?: string
-      effortLevel?: string
-      openAIFastMode?: boolean
-    },
+    metadata: SessionMetadataPatch,
   ): boolean {
     if (!launchInfo) return false
     if (metadata.additionalDirectories !== undefined && JSON.stringify(launchInfo.additionalDirectories ?? []) !== JSON.stringify(metadata.additionalDirectories)) return false
@@ -1298,6 +1294,7 @@ export class SessionService {
     if (metadata.runtimeModelId && launchInfo.runtimeModelId !== metadata.runtimeModelId) {
       return false
     }
+    if (metadata.antigravitySessionId !== undefined && launchInfo.antigravitySessionId !== metadata.antigravitySessionId) return false
     if (launchInfo.effortLevel !== resolveSessionEffortLevel(metadata, launchInfo.effortLevel)) {
       return false
     }
@@ -1578,6 +1575,7 @@ export class SessionService {
         runtimeProviderId: undefined as string | null | undefined,
         runtimeModelId: undefined as string | undefined, effortLevel: undefined as string | undefined,
         openAIFastMode: undefined as boolean | undefined,
+        antigravitySessionId: undefined as string | undefined,
         customTitle: null as string | null, nonemptyCustomTitle: null as string | null,
         goalTitle: null as string | null, aiTitle: null as string | null, firstUserTitle: null as string | null,
         createdAt: null as string | null, modifiedAt: null as string | null,
@@ -1605,6 +1603,10 @@ export class SessionService {
           if (typeof record.runtimeModelId === 'string') state.runtimeModelId = record.runtimeModelId
           state.effortLevel = resolveSessionEffortLevel(record, state.effortLevel)
           if (typeof record.openAIFastMode === 'boolean') state.openAIFastMode = record.openAIFastMode
+          // 旧会话没有 ACP 会话 ID；读取时保持缺省，不重写旧记录。
+          if (typeof record.antigravitySessionId === 'string' && record.antigravitySessionId.length <= 512) {
+            state.antigravitySessionId = record.antigravitySessionId
+          }
         }
         state.repository = this.resolveRepositoryFromEntries([entry]) ?? state.repository
         const worktree = this.resolveWorktreeSessionFromEntries([entry])
@@ -1655,6 +1657,7 @@ export class SessionService {
           customTitle: launch.customTitle,
           transcriptMessageCount: launch.launchCount,
           ...shared(launch),
+          ...(launch.antigravitySessionId ? { antigravitySessionId: launch.antigravitySessionId } : {}),
         },
         customTitle: launch.nonemptyCustomTitle,
         transcriptMetadata: { ...transcriptMetadata, cwd: launch.cwd },
@@ -3202,6 +3205,10 @@ export class SessionService {
     model: string,
     launchInfoOverride?: ProviderContextWindowHint | null,
     hints: { autoCompactWindow?: string } = {},
+    officialRuntimeEnvs?: {
+      openAI?: Record<string, string> | null
+      grok?: Record<string, string> | null
+    },
   ): Promise<number | undefined> {
     const launchInfo = launchInfoOverride ?? await this.getSessionLaunchInfo(sessionId).catch(() => null)
     const providerIds: string[] = []
@@ -3241,7 +3248,11 @@ export class SessionService {
     let sessionProviderAutoCompactWindow: string | undefined
     let sawSessionProvider = false
     for (const providerId of providerIds) {
-      const env = await this.providerService.getProviderRuntimeEnv(providerId).catch(() => null)
+      const env = officialRuntimeEnvs?.openAI !== undefined && isOpenAIOfficialProviderId(providerId)
+        ? officialRuntimeEnvs.openAI
+        : officialRuntimeEnvs?.grok !== undefined && isGrokOfficialProviderId(providerId)
+          ? officialRuntimeEnvs.grok
+          : await this.providerService.getProviderRuntimeEnv(providerId, { cachedCatalogOnly: true }).catch(() => null)
       hints.autoCompactWindow = env?.[AUTO_COMPACT_WINDOW_ENV_KEY]
       if (env && !sawSessionProvider) {
         sawSessionProvider = true
@@ -3393,6 +3404,10 @@ export class SessionService {
     sessionId: string,
     model: string,
     launchInfo?: ProviderContextWindowHint | null,
+    officialRuntimeEnvs?: {
+      openAI?: Record<string, string> | null
+      grok?: Record<string, string> | null
+    },
   ): Promise<number> {
     const hints: { autoCompactWindow?: string } = {}
     const providerContextWindow = await this.getProviderContextWindowForSession(
@@ -3400,6 +3415,7 @@ export class SessionService {
       model,
       launchInfo,
       hints,
+      officialRuntimeEnvs,
     )
     if (providerContextWindow !== undefined) {
       return applyAutoCompactWindowLimit(providerContextWindow, hints.autoCompactWindow, true)
@@ -3426,8 +3442,8 @@ export class SessionService {
     return (await this.getInspectionTranscriptSnapshot(sessionId))?.metadata ?? null
   }
 
-  private async buildTranscriptContextEstimate(
-    sessionId: string,
+  private buildTranscriptContextEstimate(
+    rawMaxTokens: number,
     latest: {
       model: string
       inputTokens: number
@@ -3438,9 +3454,7 @@ export class SessionService {
     estimatedTokensFromMessages: number,
     estimatedTokensAfterUsage: number,
     transcriptHasMediaInput: boolean,
-    launchInfo?: ProviderContextWindowHint | null,
-  ): Promise<TranscriptContextEstimate> {
-    const rawMaxTokens = await this.getSessionModelContextWindow(sessionId, latest.model, launchInfo)
+  ): TranscriptContextEstimate {
     const promptTokens = latest.inputTokens + latest.cacheReadInputTokens + latest.cacheCreationInputTokens
     const providerTokens = promptTokens + latest.outputTokens
     const hasProviderUsage = promptTokens > 0
@@ -3532,9 +3546,15 @@ export class SessionService {
     const stat = await fs.stat(found.filePath, { bigint: true })
     // The transcript is immutable between polls, but its interpreted token budget
     // also depends on editable provider settings and process-level overrides.
-    const providers = await this.providerService.listProviders().catch(() => null)
+    const [providers, openAIRuntimeEnv, grokRuntimeEnv] = await Promise.all([
+      this.providerService.listProviders().catch(() => null),
+      this.providerService.getProviderRuntimeEnv(OPENAI_OFFICIAL_PROVIDER_ID, { cachedCatalogOnly: true }).catch(() => null),
+      this.providerService.getProviderRuntimeEnv(GROK_OFFICIAL_PROVIDER_ID, { cachedCatalogOnly: true }).catch(() => null),
+    ])
     const contextRevision = createHash('sha256').update(JSON.stringify({
       activeId: providers?.activeId,
+      openAIRuntimeEnv,
+      grokRuntimeEnv,
       providers: providers?.providers.map(provider => ({
         id: provider.id,
         models: provider.models,
@@ -3553,7 +3573,10 @@ export class SessionService {
     const existing = this.inspectionSnapshots.get(key)
     if (existing) return existing
     const request = (async () => {
-      const snapshot = await this.readInspectionTranscriptSnapshot(sessionId)
+      const snapshot = await this.readInspectionTranscriptSnapshot(sessionId, {
+        openAI: openAIRuntimeEnv,
+        grok: grokRuntimeEnv,
+      })
       const after = await fs.stat(found.filePath, { bigint: true })
       if (after.dev !== stat.dev || after.ino !== stat.ino || after.size !== stat.size || after.mtimeNs !== stat.mtimeNs || after.ctimeNs !== stat.ctimeNs) {
         throw ApiError.conflict('Transcript changed during inspection; retry the request')
@@ -3569,7 +3592,13 @@ export class SessionService {
     catch (error) { this.inspectionSnapshots.delete(key); throw error }
   }
 
-  private async readInspectionTranscriptSnapshot(sessionId: string): Promise<SessionInspectionTranscriptSnapshot | null> {
+  private async readInspectionTranscriptSnapshot(
+    sessionId: string,
+    officialRuntimeEnvs: {
+      openAI: Record<string, string> | null
+      grok: Record<string, string> | null
+    },
+  ): Promise<SessionInspectionTranscriptSnapshot | null> {
     const found = await this.findSessionFile(sessionId)
     if (!found) return null
 
@@ -3787,6 +3816,7 @@ export class SessionService {
         sessionId,
         modelUsage.model,
         modelRuntimeHints.get(modelUsage.model),
+        officialRuntimeEnvs,
       )
     }
 
@@ -3818,13 +3848,12 @@ export class SessionService {
         }
     const latestContextUsage = resolveTranscriptContextUsage(contextState)
     const contextEstimate = latestContextUsage
-      ? await this.buildTranscriptContextEstimate(
-          sessionId,
+      ? this.buildTranscriptContextEstimate(
+          await this.getSessionModelContextWindow(sessionId, latestContextUsage.model, launchInfo, officialRuntimeEnvs),
           latestContextUsage,
           contextState.estimatedTokensFromMessages,
           contextState.estimatedTokensAfterUsage + contextState.unreportedOutputTokens,
           contextState.transcriptHasMediaInput,
-          launchInfo,
         )
       : null
 
@@ -5062,6 +5091,7 @@ export class SessionService {
     repositoryOptions?: CreateSessionRepositoryOptions,
     permissionMode?: string,
     agentProfile: 'standard' | 'lean' = 'standard',
+    launchProviderId?: string,
   ): Promise<{ sessionId: string; workDir: string; agentProfile: 'standard' | 'lean' }> {
     if (agentProfile === 'lean' && permissionMode === 'plan') throw new Error('Plan mode is unavailable in lean sessions. Choose another permission mode.')
     // Default to user home directory when no workDir specified
@@ -5081,6 +5111,9 @@ export class SessionService {
     const absWorkDir = preparedWorkspace.workDir
     const { additionalDirectories: configuredDirectories } = await new DesktopUiPreferencesService().getProjectDirectories(preparedWorkspace.repository?.requestedWorkDir || absWorkDir)
     const additionalDirectories = await validateProjectAdditionalDirectories(absWorkDir, configuredDirectories)
+    if (launchProviderId === ANTIGRAVITY_PROVIDER_ID && additionalDirectories.length > 0) {
+      throw new ApiError(400, 'Antigravity does not support additional folders. Choose a project without additional folders or switch providers.', 'ANTIGRAVITY_UNSUPPORTED')
+    }
     registerCanonicalFilesystemAccessRoot(absWorkDir)
     console.log(
       `[SessionService] createSession: requested workDir=${JSON.stringify(
@@ -5415,13 +5448,16 @@ export class SessionService {
         extra: {} as Record<string, unknown>,
         permissionMode: undefined as string | undefined,
         runtime: {} as { runtimeProviderId?: string | null, runtimeModelId?: string, effortLevel?: string, openAIFastMode?: boolean } }
+      let detachesAntigravity = false
       await streamBoundedHistory(found.filePath, entry => {
         const record = entry as RawEntry
         if (record.type === 'session-meta') {
           // Unknown extension fields merge as patches. The runtime selection does
           // not: a complete selection without effortLevel means auto, so it is
           // reduced exactly like the launch metadata projection instead.
-          const { runtimeProviderId, runtimeModelId, effortLevel: _effortLevel, openAIFastMode, ...extension } = entry
+          // /clear 清空界面历史，也必须与原 Antigravity 对话解绑。
+          const { runtimeProviderId, runtimeModelId, effortLevel: _effortLevel, openAIFastMode, antigravitySessionId, ...extension } = entry
+          detachesAntigravity ||= typeof antigravitySessionId === 'string'
           Object.assign(preserved.extra, extension)
           if (runtimeProviderId === null || typeof runtimeProviderId === 'string') preserved.runtime.runtimeProviderId = runtimeProviderId
           if (typeof runtimeModelId === 'string') preserved.runtime.runtimeModelId = runtimeModelId
@@ -5486,13 +5522,21 @@ export class SessionService {
 
       if (!this.shouldPersistSession()) return
       this.memoryLaunchInfo.delete(this.memorySessionKey(sessionId))
-      await fs.writeFile(
-        found.filePath,
-        [initialEntry, metaEntry, ...(customTitleEntry ? [customTitleEntry] : [])]
-          .map(entry => JSON.stringify(entry))
-          .join('\n') + '\n',
-        'utf-8',
-      )
+      const replacement = [initialEntry, metaEntry, ...(customTitleEntry ? [customTitleEntry] : [])]
+        .map(entry => JSON.stringify(entry)).join('\n') + '\n'
+      if (detachesAntigravity) {
+        // 替换文件而不是原地截断，确保已缓存的历史游标不会读到旧 ACP 回合。
+        const tempFilePath = `${found.filePath}.clear-${crypto.randomUUID()}.tmp`
+        try {
+          await fs.writeFile(tempFilePath, replacement, { flag: 'wx', mode: 0o600 })
+          if (!this.shouldPersistSession()) return
+          await fs.rename(tempFilePath, found.filePath)
+        } finally {
+          await fs.rm(tempFilePath, { force: true })
+        }
+      } else {
+        await fs.writeFile(found.filePath, replacement, 'utf-8')
+      }
       if (customTitleEntry) {
         this.syncIndexedSessionTitle(sessionId, customTitleEntry.customTitle)
       }
@@ -5513,6 +5557,31 @@ export class SessionService {
     } finally {
       this.clearingTaskNotificationSessions.delete(sessionId)
     }
+  }
+
+  async appendAntigravityMessages(
+    sessionId: string,
+    nativeSessionId: string,
+    messages: Record<string, unknown>[],
+    isCurrent: () => boolean,
+  ): Promise<void> {
+    await this.withSessionMetadataMutation(sessionId, async () => {
+      const launchInfo = await this.getSessionLaunchInfo(sessionId)
+      if (!this.shouldPersistSession() || !isCurrent() || launchInfo?.antigravitySessionId !== nativeSessionId) {
+        throw new Error('Antigravity session is no longer active')
+      }
+      const handle = await fs.open(launchInfo.filePath, constants.O_WRONLY | constants.O_APPEND)
+      try {
+        if (!this.shouldPersistSession() || !isCurrent()) throw new Error('Antigravity session is no longer active')
+        const timestamp = new Date().toISOString()
+        await handle.writeFile(messages.map(message => JSON.stringify({
+          ...message, sessionId, cwd: launchInfo.workDir, timestamp,
+        }) + '\n').join(''), 'utf-8')
+      } finally {
+        await handle.close()
+      }
+      this.invalidateSessionListCache()
+    })
   }
 
   async appendSessionMetadata(
@@ -5671,6 +5740,7 @@ export class SessionService {
         ? { runtimeProviderId: metadata.runtimeProviderId }
         : {}),
       ...(metadata.runtimeModelId ? { runtimeModelId: metadata.runtimeModelId } : {}),
+      ...(metadata.antigravitySessionId ? { antigravitySessionId: metadata.antigravitySessionId } : {}),
       ...(metadata.effortLevel && VALID_SESSION_EFFORT_LEVELS.has(metadata.effortLevel)
         ? { effortLevel: metadata.effortLevel }
         : {}),

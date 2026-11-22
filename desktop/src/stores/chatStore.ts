@@ -20,11 +20,14 @@ import { useSessionRuntimeStore } from './sessionRuntimeStore'
 import { useProviderStore } from './providerStore'
 import { reconcileRuntimeSelection, resolveActiveProviderRuntimeSelection } from '../lib/runtimeSelection'
 import { useSettingsStore } from './settingsStore'
+import { useUIStore } from './uiStore'
+import { ASK_USER_QUESTION_CLARIFY_MESSAGE } from '../../../src/constants/messages'
 import { isModelReasoningEffort } from '../../../src/shared/modelReasoning'
 import { OPENAI_OFFICIAL_PROVIDER_ID } from '../constants/openaiOfficialProvider'
 import { useTabStore } from './tabStore'
 import { randomSpinnerVerb } from '../config/spinnerVerbs'
 import { notifyDesktop } from '../lib/desktopNotifications'
+import { createUnreadCompletion, recoveredUnreadCompletion, type UnreadCompletion } from '../lib/unreadCompletion'
 import { createAsyncRefreshCoalescer } from '../lib/asyncRefreshCoalescer'
 import { deriveSessionTitle, isPlaceholderSessionTitle } from '../lib/sessionTitle'
 import { formatBytes } from '../lib/formatBytes'
@@ -149,6 +152,11 @@ export type PendingPermission = {
   input: unknown
   description?: string
   displayName?: string
+  planRuntimeSubmission?: {
+    previousSelection?: RuntimeSelection
+    stagedSelection?: RuntimeSelection
+  }
+  planRuntimeError?: string
 }
 
 type PendingPermissions = Record<string, PendingPermission>
@@ -431,20 +439,31 @@ export type AskUserQuestionDraft = {
   activeTab: number
   selections: Record<number, string[]>
   freeTexts: Record<number, string>
+  images?: Record<number, ComposerAttachment[]>
   /**
    * Terminal states only this renderer knows about. The server records neither,
    * so without them a remount would resurrect an answerable form — and let the
-   * same answer be delivered twice.
+   * same answer be delivered twice. `submitted` bridges the brief window while
+   * async server-side image materialization runs before `tool_result` arrives.
    */
+  submitted?: boolean
   sentAsMessage?: boolean
   handedOff?: boolean
 }
+
+// Rollback stash for in-flight permission responses carrying attachments. If
+// server-side image materialization fails, the pending permission is restored
+// so the user can retry without losing their AskUserQuestion draft.
+const pendingAttachmentPermissionStash = new Map<string, PendingPermission>()
 
 type ChatStore = {
   applyBoundedUpdate: (update: (state: ChatStore) => Partial<ChatStore>) => void
   /** Test-only: register fixture rows as durable so eviction can exercise them. */
   markHistoryRowsDurable: (sessionId: string, rows: UIMessage[]) => void
   sessions: Record<string, PerSessionState>
+  /** Kept independently of transcripts so releasing a background socket keeps its unread reply. */
+  unreadCompletions: ReadonlyMap<string, UnreadCompletion>
+  markSessionCompletionRead: (sessionId: string, expected?: UnreadCompletion) => void
   /** sessionId → toolUseId → draft. In-memory, like `composerDraft`. */
   askUserQuestionDrafts: Record<string, Record<string, AskUserQuestionDraft>>
 
@@ -487,11 +506,12 @@ type ChatStore = {
       rule?: string
       updatedInput?: Record<string, unknown>
       denyMessage?: string
+      attachments?: AttachmentRef[]
       permissionUpdates?: PermissionUpdate[]
       /** Execution-model switch applied together with an ExitPlanMode approval. */
       runtimeOverride?: RuntimeSelection
     },
-  ) => void
+  ) => boolean
   recordAskUserQuestionActivity: (sessionId: string, requestId: string) => void
   respondToComputerUsePermission: (
     sessionId: string,
@@ -2692,6 +2712,7 @@ type HistoryLoadInFlight = {
 }
 
 type TerminalReconnectHistoryBoundary = {
+  pendingCompletionMessages?: readonly UIMessage[]
   lifecycleGeneration: number
   preHydrationGap: boolean
   activated: boolean
@@ -2717,6 +2738,12 @@ type TerminalReconnectHistoryBoundary = {
 }
 
 const historyLoadsInFlight = new Map<string, HistoryLoadInFlight>()
+/** A closed tab still needs the terminal REST result to learn what finished during its socket gap. */
+export function isRecoveringSessionCompletion(sessionId: string): boolean {
+  return !!terminalReconnectHistoryBoundaries.get(sessionId)?.pendingCompletionMessages && (
+    useChatStore.getState().sessions[sessionId]?.awaitingReconnectSync === true || historyLoadsInFlight.has(sessionId)
+  )
+}
 const historyRecoveryControllers = new Map<string, AbortController>()
 const historyPageControllers = new Map<string, AbortController>()
 // Rows produced by the most recent durable history load, per session. Idle-tab
@@ -2924,6 +2951,10 @@ function ensureTerminalReconnectHistoryBoundary(
 
   const taskStore = useCLITaskStore.getState()
   const boundary: TerminalReconnectHistoryBoundary = {
+    // The permission snapshot can already say idle by the time sync_state
+    // arrives. Capture the active turn at disconnect, while it is still known.
+    pendingCompletionMessages: options?.activated === false && session.chatState !== 'idle' &&
+      !session.awaitingStopIdle && !isScheduledTaskTurn(session) ? session.messages : undefined,
     lifecycleGeneration,
     preHydrationGap: options?.preHydrationGap ?? false,
     activated: options?.activated ?? true,
@@ -3256,6 +3287,14 @@ export const useChatStore = create<ChatStore>((setState, get) => {
   applyBoundedUpdate: set,
   markHistoryRowsDurable,
   sessions: {},
+  unreadCompletions: new Map(),
+  markSessionCompletionRead: (sessionId, expected) => {
+    const current = get().unreadCompletions
+    if (!current.has(sessionId) || (expected && current.get(sessionId) !== expected)) return
+    const unreadCompletions = new Map(current)
+    unreadCompletions.delete(sessionId)
+    set({ unreadCompletions })
+  },
   askUserQuestionDrafts: {},
 
   setAskUserQuestionDraft: (sessionId, toolUseId, draft) => {
@@ -3263,8 +3302,13 @@ export const useChatStore = create<ChatStore>((setState, get) => {
       const forSession = { ...(state.askUserQuestionDrafts[sessionId] ?? {}) }
       // The card writes on every mount, so an unfinished card must not leave an
       // entry behind for every question the user never touched.
+      const hasImages = Boolean(
+        draft.images && Object.values(draft.images).some((items) => items.length > 0),
+      )
       const isEmpty = Object.keys(draft.selections).length === 0 &&
         Object.keys(draft.freeTexts).length === 0 &&
+        !hasImages &&
+        !draft.submitted &&
         !draft.sentAsMessage &&
         !draft.handedOff
       if (isEmpty) {
@@ -3402,6 +3446,8 @@ export const useChatStore = create<ChatStore>((setState, get) => {
           const taskStoreAtReconnect = useCLITaskStore.getState()
           terminalReconnectHistoryBoundaries.set(sessionId, {
             ...pendingTerminalBoundary,
+            pendingCompletionMessages: currentSession.chatState !== 'idle' && !currentSession.awaitingStopIdle &&
+              !isScheduledTaskTurn(currentSession) ? currentSession.messages : pendingTerminalBoundary.pendingCompletionMessages,
             lifecycleGeneration: nextLifecycleGeneration,
             latestTerminalBoundaryCaptured: false,
             // Foreground transcript rows produced since an earlier failed
@@ -3786,16 +3832,39 @@ export const useChatStore = create<ChatStore>((setState, get) => {
   },
 
   respondToPermission: (sessionId, requestId, allowed, options) => {
-    wsManager.send(sessionId, {
+    const pending = getPendingPermission(get().sessions[sessionId], requestId)
+    if (pending?.planRuntimeSubmission) return false
+    const payload: ClientMessage = {
       type: 'permission_response',
       requestId,
       allowed,
       ...(options?.rule ? { rule: options.rule } : {}),
       ...(options?.updatedInput ? { updatedInput: options.updatedInput } : {}),
       ...(options?.denyMessage ? { denyMessage: options.denyMessage } : {}),
+      ...(options?.attachments?.length ? { attachments: options.attachments } : {}),
       ...(options?.permissionUpdates?.length ? { permissionUpdates: options.permissionUpdates } : {}),
       ...(options?.runtimeOverride ? { runtimeOverride: options.runtimeOverride } : {}),
-    })
+    }
+    if (options?.attachments?.length && rejectOversizedMessage(sessionId, payload)) return false
+    if (options?.attachments?.length && pending) {
+      pendingAttachmentPermissionStash.set(`${sessionId}:${requestId}`, pending)
+    }
+    const submittingPlanRuntime = pending?.toolName === 'ExitPlanMode' && options?.runtimeOverride
+    if (submittingPlanRuntime) {
+      const runtime = useSessionRuntimeStore.getState()
+      const previousSelection = runtime.selections[sessionId]
+      runtime.setSelection(sessionId, submittingPlanRuntime)
+      const stagedSelection = useSessionRuntimeStore.getState().selections[sessionId]
+      const submitted = { ...pending, planRuntimeSubmission: { previousSelection, stagedSelection }, planRuntimeError: undefined }
+      set((s) => ({
+        sessions: updateSessionIn(s.sessions, sessionId, (session) => ({
+          pendingPermissions: { ...getPendingPermissionRecord(session), [requestId]: submitted },
+          pendingPermission: session.pendingPermission?.requestId === requestId ? submitted : session.pendingPermission,
+        })),
+      }))
+    }
+    wsManager.send(sessionId, payload)
+    if (submittingPlanRuntime) return true
     set((s) => ({
       sessions: updateSessionIn(s.sessions, sessionId, (session) => {
         const pendingPermissions = getPendingPermissionRecord(session)
@@ -3813,6 +3882,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         }
       }),
     }))
+    return true
   },
 
   recordAskUserQuestionActivity: (sessionId, requestId) => {
@@ -3866,6 +3936,8 @@ export const useChatStore = create<ChatStore>((setState, get) => {
   },
 
   stopGeneration: (sessionId) => {
+    const boundary = terminalReconnectHistoryBoundaries.get(sessionId)
+    if (boundary) delete boundary.pendingCompletionMessages
     wsManager.send(sessionId, { type: 'stop_generation' })
     if (
       !isSideChatSession(sessionId) &&
@@ -4073,6 +4145,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         )
         durableHistoryRows.set(sessionId, new WeakSet(uiMessages))
         let historyApplied = false
+        let recoveredCompletion: UnreadCompletion | undefined
         set((state) => {
           if (!isCurrentHistoryLifecycle(sessionId, lifecycleGeneration)) return state
           const session = state.sessions[sessionId]
@@ -4120,6 +4193,13 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             ? { input_tokens: 0, output_tokens: 0 }
             : tokenUsage
           historyApplied = true
+          const before = terminalReconnectBoundary?.pendingCompletionMessages
+          if (before && discardBaselineMessages && session.chatState === 'idle') {
+            const previousIds = new Set(before.map(row => row.id))
+            const hasNewTurn = session.messages.some(row => !previousIds.has(row.id) &&
+              (row.type === 'user_text' || row.type === 'error' || (row.type === 'system' && row.generationStopped)))
+            if (!hasNewTurn) recoveredCompletion = recoveredUnreadCompletion(before, uiMessages)
+          }
           if (session.messages.length > 0) {
             return { sessions: updateSessionIn(state.sessions, sessionId, (s) => {
               const currentBackgroundAgentTasks = reconcileBackgroundActivityAtApply &&
@@ -4331,6 +4411,10 @@ export const useChatStore = create<ChatStore>((setState, get) => {
           }) }
         })
         if (!historyApplied) return
+        if (recoveredCompletion) {
+          const unreadCompletions = new Map(get().unreadCompletions).set(sessionId, recoveredCompletion)
+          set({ unreadCompletions })
+        }
         if (!historyComplete && page) void recoverSessionHistory(sessionId, page.sourceVersion)
         if (
           terminalReconnectBoundary &&
@@ -4922,6 +5006,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
   },
 
   clearMessages: (sessionId) => {
+    get().markSessionCompletionRead(sessionId)
     advanceHistoryLifecycle(sessionId)
     clearPendingTaskToolUseIds(sessionId)
     clearPendingToolParentUseIds(sessionId)
@@ -5090,6 +5175,8 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         }
 
         if (msg.turnState === 'running') {
+          const boundary = terminalReconnectHistoryBoundaries.get(sessionId)
+          if (boundary) delete boundary.pendingCompletionMessages
           // Raw deltas are not replayable across a socket gap. Discard the
           // uncommitted attempt instead of appending new deltas (or a missed
           // stream_retry attempt) to stale text/tool JSON. Persisted completed
@@ -5826,6 +5913,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         break
 
       case 'permission_resolved':
+        pendingAttachmentPermissionStash.delete(`${sessionId}:${msg.requestId}`)
         update((session) => {
           if (msg.permissionType === 'computer_use') {
             const pendingComputerUsePermissions = getPendingComputerUsePermissionRecord(session)
@@ -5938,30 +6026,39 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         }
         const appendedCompletionMessage = completionMessages !== session.messages
         const finalMessages = markPendingToolUseMessagesStopped(completionMessages)
-        const hasRunningBackgroundAgents = hasRunningBackgroundTasks(session.backgroundAgentTasks)
-        if (session.elapsedTimer) clearInterval(session.elapsedTimer)
-        update((current) => ({
-          messages: finalMessages,
-          scheduledTaskTurn: false,
-          tokenUsage: msg.usage,
-          chatState: 'idle',
-          awaitingStopIdle: false,
-          activeThinkingId: null,
-          pendingPermission: null,
-          pendingPermissions: {},
-          pendingComputerUsePermission: null,
-          pendingComputerUsePermissions: {},
-          elapsedTimer: null,
-          apiRetry: null,
-          streamingFallback: null,
-          replaceHistoryOnCompletion: false,
-          backgroundContinueNoticeId: undefined,
-          historyMutationEpoch: (current.historyMutationEpoch ?? 0) + 1,
-        }))
-        useTabStore.getState().updateTabStatus(sessionId, hasRunningBackgroundAgents ? 'running' : 'idle')
-        const notification = wasAgentRunning && appendedCompletionMessage && !wasScheduledTaskTurn
+        const completedReply = wasAgentRunning && appendedCompletionMessage && !wasScheduledTaskTurn
+          ? completionMessages[findStreamMergeTargetIndex(completionMessages)]
+          : undefined
+        const marker = completedReply?.type === 'assistant_text' ? createUnreadCompletion(completionMessages, completedReply) : undefined
+        const boundary = terminalReconnectHistoryBoundaries.get(sessionId)
+        if (marker && boundary) delete boundary.pendingCompletionMessages
+        const notification = marker
           ? buildAgentCompletionNotification(sessionId, finalMessages, text)
           : null
+        const hasRunningBackgroundAgents = hasRunningBackgroundTasks(session.backgroundAgentTasks)
+        if (session.elapsedTimer) clearInterval(session.elapsedTimer)
+        set(state => ({
+          unreadCompletions: marker ? new Map(state.unreadCompletions).set(sessionId, marker) : state.unreadCompletions,
+          sessions: updateSessionIn(state.sessions, sessionId, current => ({
+            messages: finalMessages,
+            scheduledTaskTurn: false,
+            tokenUsage: msg.usage,
+            chatState: 'idle',
+            awaitingStopIdle: false,
+            activeThinkingId: null,
+            pendingPermission: null,
+            pendingPermissions: {},
+            pendingComputerUsePermission: null,
+            pendingComputerUsePermissions: {},
+            elapsedTimer: null,
+            apiRetry: null,
+            streamingFallback: null,
+            replaceHistoryOnCompletion: false,
+            backgroundContinueNoticeId: undefined,
+            historyMutationEpoch: (current.historyMutationEpoch ?? 0) + 1,
+          })),
+        }))
+        useTabStore.getState().updateTabStatus(sessionId, hasRunningBackgroundAgents ? 'running' : 'idle')
         if (notification) {
           void notifyDesktop({
             dedupeKey: notification.dedupeKey,
@@ -6017,6 +6114,64 @@ export const useChatStore = create<ChatStore>((setState, get) => {
       }
 
       case 'error': {
+        const session = get().sessions[sessionId]
+        if (session && (msg.permissionRequestId || msg.code === 'RUNTIME_CONFIG_INVALID' || msg.code === 'SIDE_CHAT_RUNTIME_RESTART_UNAVAILABLE')) {
+          const pendingPermissions = getPendingPermissionRecord(session)
+          // Older servers did not correlate runtime rejections with the plan
+          // review. A review awaiting a model change can still retry them.
+          const request = msg.permissionRequestId
+            ? pendingPermissions[msg.permissionRequestId]
+            : Object.values(pendingPermissions).find((pending) => pending.planRuntimeSubmission)
+          if (request?.planRuntimeSubmission) {
+            const runtime = useSessionRuntimeStore.getState()
+            const { previousSelection, stagedSelection } = request.planRuntimeSubmission
+            if (runtime.selections[sessionId] === stagedSelection) {
+              if (previousSelection) {
+                runtime.setSelection(sessionId, previousSelection)
+                runtime.settleSelection(sessionId)
+              } else {
+                runtime.clearSelection(sessionId)
+              }
+            }
+            const rejected = { ...request, planRuntimeSubmission: undefined, planRuntimeError: msg.message }
+            update((current) => ({
+              pendingPermissions: { ...getPendingPermissionRecord(current), [request.requestId]: rejected },
+              pendingPermission: current.pendingPermission?.requestId === request.requestId ? rejected : current.pendingPermission,
+              chatState: 'permission_pending',
+            }))
+            break
+          }
+          if (msg.code === 'ATTACHMENT_PROCESSING_FAILED' && msg.permissionRequestId) {
+            const stashKey = `${sessionId}:${msg.permissionRequestId}`
+            const stashed = pendingAttachmentPermissionStash.get(stashKey)
+            pendingAttachmentPermissionStash.delete(stashKey)
+            if (stashed) {
+              update((current) => ({
+                pendingPermissions: { ...getPendingPermissionRecord(current), [stashed.requestId]: stashed },
+                pendingPermission: stashed,
+                chatState: 'permission_pending',
+              }))
+              if (stashed.toolUseId) {
+                const toolUseId = stashed.toolUseId
+                set((state) => {
+                  let changed = false
+                  const nextDrafts = { ...state.askUserQuestionDrafts }
+                  for (const [draftSessionId, byTool] of Object.entries(nextDrafts)) {
+                    const draft = byTool[toolUseId]
+                    if (!draft || (!draft.submitted && !draft.handedOff)) continue
+                    const { submitted: _s, handedOff: _h, ...rest } = draft
+                    nextDrafts[draftSessionId] = { ...byTool, [toolUseId]: rest }
+                    changed = true
+                  }
+                  return changed ? { askUserQuestionDrafts: nextDrafts } : {}
+                })
+              }
+            }
+            useUIStore?.getState().addToast({ type: 'error', message: msg.message })
+            break
+          }
+          if (msg.permissionRequestId) break
+        }
         if (msg.code === 'RUNTIME_CONFIG_INVALID' || msg.code === 'CLI_RESTART_FAILED') {
           // Let a fresh server snapshot reconcile a rejected optimistic choice.
           useSessionRuntimeStore.getState().settleSelection(sessionId)
@@ -6157,6 +6312,18 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             useSessionStore.getState().updateSessionWorkDir(sessionId, cwd)
           }
         }
+        if (msg.subtype === 'fast_mode_status') {
+          const data = msg.data as { fastModeState?: unknown; reason?: unknown } | undefined
+          if (data?.reason === 'org_disabled' || data?.reason === 'overage_rejected') {
+            useSettingsStore.setState({ fastMode: false })
+            if (typeof msg.message === 'string' && msg.message.trim()) {
+              useUIStore.getState().addToast({ type: 'warning', message: msg.message })
+            }
+          } else if (data?.fastModeState === 'cooldown' && typeof msg.message === 'string' && msg.message.trim()) {
+            useUIStore.getState().addToast({ type: 'info', message: msg.message })
+          }
+          break
+        }
         if (msg.subtype === 'scheduled_tasks_changed') {
           void useTaskStore.getState().fetchTasks()
           break
@@ -6207,6 +6374,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             })
         }
         if (msg.subtype === 'session_cleared') {
+          get().markSessionCompletionRead(sessionId)
           pendingOwnedTaskEvents.delete(sessionId)
           advanceHistoryLifecycle(sessionId)
           advanceSlashCommandGeneration(sessionId)
@@ -6882,12 +7050,29 @@ function normalizeHistoryToolResultContent(content: unknown, toolUseResult: unkn
   const result = readRecord(toolUseResult)
   if (parseScheduledTaskResult('ScheduledTask', result)) return result
   const answers = readRecord(result?.answers)
-  if (!result || !answers || !Array.isArray(result.questions)) return content
-  return {
-    questions: result.questions,
-    answers,
-    ...(result.selectionSource === 'automatic' ? { selectionSource: 'automatic' } : {}),
+  if (result && answers && Array.isArray(result.questions)) {
+    const annotations = readRecord(result.annotations)
+    return {
+      questions: result.questions,
+      answers,
+      ...(annotations && Object.keys(annotations).length > 0 ? { annotations } : {}),
+      ...(result.selectionSource === 'automatic' ? { selectionSource: 'automatic' } : {}),
+    }
   }
+  if (typeof content === 'string' && content.startsWith(ASK_USER_QUESTION_CLARIFY_MESSAGE)) {
+    return {
+      handedOff: true,
+      message: content,
+    }
+  }
+  return content
+}
+
+function isStructuredAskUserQuestionResult(value: unknown): value is Record<string, unknown> {
+  const record = readRecord(value)
+  if (!record) return false
+  if (Array.isArray(record.questions) && readRecord(record.answers)) return true
+  return record.handedOff === true
 }
 
 function parseJsonRecord(value: unknown): Record<string, unknown> | null {
@@ -8549,6 +8734,10 @@ export function mapHistoryMessagesToUiMessages(
       const userBlocks = msg.content as UserHistoryBlock[]
       const hasImageBlock = userBlocks.some((block) => block.type === 'image')
       const toolResultCount = userBlocks.filter((block) => block.type === 'tool_result').length
+      const hasAskQuestionToolResult = toolResultCount === 1 && userBlocks.some((block) =>
+        block.type === 'tool_result' &&
+        isStructuredAskUserQuestionResult(normalizeHistoryToolResultContent(block.content, msg.toolUseResult)),
+      )
       const entryDurationMs =
         toolResultCount === 1 &&
         typeof msg.durationMs === 'number' &&
@@ -8565,11 +8754,12 @@ export function mapHistoryMessagesToUiMessages(
           visibleTextParts.push(...teammateMessages.map((message) => message.content))
         } else if (block.type === 'text' && block.text) {
           modelTextParts.push(block.text)
-          const imageSourcePath = hasImageBlock ? extractImageMetadataSourcePath(block.text) : undefined
+          const canCarryImageMetadata = hasImageBlock || hasAskQuestionToolResult
+          const imageSourcePath = canCarryImageMetadata ? extractImageMetadataSourcePath(block.text) : undefined
           if (imageSourcePath) {
             imageSourcePaths.push(imageSourcePath)
           }
-          if (!hasImageBlock || !isGeneratedImageMetadataText(block.text)) {
+          if (!canCarryImageMetadata || !isGeneratedImageMetadataText(block.text)) {
             visibleTextParts.push(block.text)
           }
         }
@@ -8588,7 +8778,28 @@ export function mapHistoryMessagesToUiMessages(
         })
       }
       applyImageMetadataSourcePaths(attachments, imageSourcePaths)
-      if (visibleTextParts.length > 0 || attachments.length > 0) {
+      if (hasAskQuestionToolResult && imageSourcePaths.length > attachments.length) {
+        for (let i = attachments.length; i < imageSourcePaths.length; i++) {
+          const sourcePath = imageSourcePaths[i]!
+          attachments.push({
+            type: 'image',
+            name: getReferenceName(sourcePath),
+            path: sourcePath,
+          })
+        }
+      }
+      let consumedAskQuestionAttachments = false
+      if (toolResultCount === 1 && visibleTextParts.length === 0 && attachments.length > 0) {
+        const lastMessage = uiMessages[uiMessages.length - 1]
+        if (lastMessage?.type === 'tool_result' && isStructuredAskUserQuestionResult(lastMessage.content)) {
+          lastMessage.content = {
+            ...lastMessage.content,
+            attachments,
+          }
+          consumedAskQuestionAttachments = true
+        }
+      }
+      if (!consumedAskQuestionAttachments && (visibleTextParts.length > 0 || attachments.length > 0)) {
         const visibleText = visibleTextParts.join('\n')
         const modelText = modelTextParts.join('\n')
         const visualSelectionDisplay =

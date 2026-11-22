@@ -95,6 +95,8 @@ export type CreateSessionRequest = {
   workDir?: string
   repository?: CreateSessionRepositoryOptions
   permissionMode?: PermissionMode
+  /** For creation-time compatibility checks only; runtime is still set separately. */
+  launchProviderId?: string
 }
 export type BranchSessionRequest = {
   targetMessageId: string
@@ -555,9 +557,34 @@ export const sessionsApi = {
       cursor = older.page.nextCursor
     }
     pages.reverse()
+    const messages = pages.flatMap(page => page.messages)
+    const latestIndexById = new Map<string, number>()
+    messages.forEach((message, index) => {
+      if (typeof message.id === 'string' && message.id.trim()) latestIndexById.set(message.id, index)
+    })
+    const taskNotifications = pages.flatMap(page => page.taskNotifications ?? [])
+    const latestNoticeIndexByKey = new Map<string, number>()
+    const noticeIdentity = (notice: AgentTaskNotification) => (
+      typeof notice.toolUseId === 'string' && notice.toolUseId.trim()
+        ? JSON.stringify([notice.ownerAgentId || null, notice.toolUseId])
+        : null
+    )
+    taskNotifications.forEach((notice, index) => {
+      const key = noticeIdentity(notice)
+      if (key !== null) latestNoticeIndexByKey.set(key, index)
+    })
     return {
-      messages: pages.flatMap(page => page.messages),
-      taskNotifications: pages.flatMap(page => page.taskNotifications ?? []),
+      // Server projection deduplicates each slice separately. Replays spanning
+      // slices must also keep only the last record, in its original position,
+      // with its metadata intact. Missing/blank identities remain independent.
+      messages: messages.filter((message, index) => {
+        const latestIndex = latestIndexById.get(message.id)
+        return latestIndex === undefined || latestIndex === index
+      }),
+      taskNotifications: taskNotifications.filter((notice, index) => {
+        const key = noticeIdentity(notice)
+        return key === null || latestNoticeIndexByKey.get(key) === index
+      }),
       page: {
         ...newest.page,
         nextCursor: null,
@@ -831,5 +858,23 @@ export const sessionsApi = {
     return api.post<SessionRewindResponse>(`/api/sessions/${sessionId}/rewind`, body, {
       timeout: 60_000,
     })
+  },
+
+  optimizePrompt(
+    sessionId: string,
+    body: { requestId: string; prompt: string },
+    signal?: AbortSignal,
+  ) {
+    return api.post<{ requestId: string; optimizedPrompt: string }>(
+      `/api/sessions/${sessionId}/optimize-prompt`,
+      body,
+      { timeout: 120_000, signal },
+    )
+  },
+
+  cancelOptimizePrompt(sessionId: string, requestId: string) {
+    return api.delete<{ requestId: string; cancelled: boolean }>(
+      `/api/sessions/${sessionId}/optimize-prompt/${requestId}`,
+    )
   },
 }
